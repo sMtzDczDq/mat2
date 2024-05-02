@@ -20,18 +20,19 @@ class AbstractFFmpegParser(exiftool.ExiftoolParser):
                             'metadata fields; mat2 filled them with standard '
                             'data.', self.filename, ', '.join(self.mimetypes))
         cmd = [_get_ffmpeg_path(),
-               '-i', self.filename,      # input file
-               '-y',                     # overwrite existing output file
-               '-map', '0',              # copy everything all streams from input to output
-               '-codec', 'copy',         # don't decode anything, just copy (speed!)
-               '-loglevel', 'panic',     # Don't show log
-               '-hide_banner',           # hide the banner
-               '-map_metadata', '-1',    # remove supperficial metadata
-               '-map_chapters', '-1',    # remove chapters
-               '-disposition', '0',      # Remove dispositions (check ffmpeg's manpage)
-               '-fflags', '+bitexact',   # don't add any metadata
-               '-flags:v', '+bitexact',  # don't add any metadata
-               '-flags:a', '+bitexact',  # don't add any metadata
+               '-i', self.filename,       # input file
+               '-y',                      # overwrite existing output file
+               '-map', '0',               # copy everything all streams from input to output
+               '-codec', 'copy',          # don't decode anything, just copy (speed!)
+               '-loglevel', 'panic',      # Don't show log
+               '-hide_banner',            # hide the banner
+               '-map_metadata', '-1',     # remove supperficial metadata
+               '-map_chapters', '-1',     # remove chapters
+               '-disposition', '0',       # Remove dispositions (check ffmpeg's manpage)
+               '-fflags', '+bitexact',    # don't add any metadata
+               '-flags:v', '+bitexact',   # don't add any metadata
+               '-flags:a', '+bitexact',   # don't add any metadata
+               '-movflags', '+faststart', # place moov atom to front of file
                self.output_filename]
         try:
             if self.sandbox:
