@@ -7,7 +7,7 @@ license = {file = "LICENSE"}
 requires-python = ">=3.9"
 dependencies = [
         'mutagen',
-        'PyGObject',
+        'PyGObject<3.51.0',
         'pycairo',
 ]
 [project.urls]
