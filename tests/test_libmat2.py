@@ -113,6 +113,11 @@ class TestGetMeta(unittest.TestCase):
         meta = p.get_meta()
         self.assertEqual(meta['Comment'], 'Created with GIMP')
 
+    #def test_webp(self):
+    #    p = images.WEBPParser('./tests/data/dirty.webp')
+    #    meta = p.get_meta()
+    #    self.assertEqual(meta['Warning'], '[minor] Improper EXIF header')
+
     def test_ppm(self):
         p = images.PPMParser('./tests/data/dirty.ppm')
         meta = p.get_meta()
@@ -333,6 +338,11 @@ class TestCleaning(unittest.TestCase):
             'parser': images.JPGParser,
             'meta': {'Comment': 'Created with GIMP'},
             'expected_meta': {},
+        #}, {
+        #    'name': 'webp',
+        #    'parser': images.WEBPParser,
+        #    'meta': {'Warning': '[minor] Improper EXIF header'},
+        #    'expected_meta': {},
         }, {
             'name': 'wav',
             'parser': audio.WAVParser,
@@ -526,7 +536,40 @@ class TestCleaning(unittest.TestCase):
             'parser': images.HEICParser,
             'meta': {},
             'expected_meta': {
+                'BlueMatrixColumn': '0.14305 0.06061 0.71393',
+                'BlueTRC': '(Binary data 32 bytes, use -b option to extract)',
+                'CMMFlags': 'Not Embedded, Independent',
+                'ChromaticAdaptation': '1.04788 0.02292 -0.05022 0.02959 0.99048 -0.01707 -0.00925 0.01508 0.75168',
+                'ChromaticityChannel1': '0.64 0.33002',
+                'ChromaticityChannel2': '0.3 0.60001',
+                'ChromaticityChannel3': '0.15001 0.06',
+                'ChromaticityChannels': 3,
+                'ChromaticityColorant': 'Unknown',
+                'ColorSpaceData': 'RGB ',
+                'ConnectionSpaceIlluminant': '0.9642 1 0.82491',
+                'DeviceAttributes': 'Reflective, Glossy, Positive, Color',
+                'DeviceManufacturer': '',
+                'DeviceMfgDesc': 'GIMP',
+                'DeviceModel': '',
+                'DeviceModelDesc': 'sRGB',
                 'ExifByteOrder': 'Big-endian (Motorola, MM)',
+                'GreenMatrixColumn': '0.38512 0.7169 0.09706',
+                'GreenTRC': '(Binary data 32 bytes, use -b option to extract)',
+                'MediaWhitePoint': '0.9642 1 0.82491',
+                'PrimaryPlatform': 'Apple Computer Inc.',
+                'ProfileCMMType': 'Little CMS',
+                'ProfileClass': 'Display Device Profile',
+                'ProfileConnectionSpace': 'XYZ ',
+                'ProfileCopyright': 'Public Domain',
+                'ProfileCreator': 'Little CMS',
+                'ProfileDateTime': '2022:05:15 16:29:22',
+                'ProfileDescription': 'GIMP built-in sRGB',
+                'ProfileFileSignature': 'acsp',
+                'ProfileID': 0,
+                'ProfileVersion': '4.3.0',
+                'RedMatrixColumn': '0.43604 0.22249 0.01392',
+                'RedTRC': '(Binary data 32 bytes, use -b option to extract)',
+                'RenderingIntent': 'Perceptual',
                 'Warning': 'Bad IFD0 directory',
             },
         }
@@ -563,13 +606,13 @@ class TestCleaning(unittest.TestCase):
                 meta = p2.get_meta()
                 if meta:
                     for k, v in p2.get_meta().items():
-                        self.assertIn(k, case['expected_meta'], '"%s" is not in "%s" (%s)' % (k, case['expected_meta'], case['name']))
+                        self.assertIn(k, case['expected_meta'], '"%s" is not in "%s" (%s), with all of them being %s' % (k, case['expected_meta'], case['name'], p2.get_meta().items()))
                         if str(case['expected_meta'][k]) in str(v):
                             continue
                         if 'extra_expected_meta' in case and k in case['extra_expected_meta']:
                             if str(case['extra_expected_meta'][k]) in str(v):
                                 continue
-                        self.assertTrue(False, "got a different value (%s) than excepted (%s) for %s" % (str(v), meta, k))
+                        self.assertTrue(False, "got a different value (%s) than excepted (%s) for %s, with all of them being %s" % (str(v), meta, k, p2.get_meta().items()))
                 self.assertTrue(p2.remove_all())
 
                 os.remove(target)
