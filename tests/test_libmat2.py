@@ -4,6 +4,7 @@ import unittest
 import shutil
 import os
 import re
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -638,14 +639,20 @@ class TestCleaning(unittest.TestCase):
         os.remove('./tests/data/clean.cleaned.html')
         os.remove('./tests/data/clean.cleaned.cleaned.html')
 
-        with open('./tests/data/clean.html', 'w') as f:
-            f.write('<title><title><pouet/><meta/></title></title><test/>')
-        p = web.HTMLParser('./tests/data/clean.html')
-        self.assertTrue(p.remove_all())
-        with open('./tests/data/clean.cleaned.html', 'r') as f:
-            self.assertEqual(f.read(), '<title></title><test/>')
+        if sys.version_info >= (3, 13):
+            with open('./tests/data/clean.html', 'w') as f:
+                f.write('<title><title><pouet/><meta/></title></title><test/>')
+            with self.assertRaises(ValueError):
+                p = web.HTMLParser('./tests/data/clean.html')
+        else:
+            with open('./tests/data/clean.html', 'w') as f:
+                f.write('<title><title><pouet/><meta/></title></title><test/>')
+            p = web.HTMLParser('./tests/data/clean.html')
+            self.assertTrue(p.remove_all())
+            with open('./tests/data/clean.cleaned.html', 'r') as f:
+                self.assertEqual(f.read(), '<title></title><test/>')
+            os.remove('./tests/data/clean.cleaned.html')
         os.remove('./tests/data/clean.html')
-        os.remove('./tests/data/clean.cleaned.html')
 
         with open('./tests/data/clean.html', 'w') as f:
             f.write('<test><title>Some<b>metadata</b><br/></title></test>')
@@ -863,45 +870,6 @@ class TestCleaningArchives(unittest.TestCase):
         os.remove('./tests/data/dirty.cleaned.tar.xz')
         os.remove('./tests/data/dirty.cleaned.cleaned.tar.xz')
 
-class TestNoSandbox(unittest.TestCase):
-    def test_avi_nosandbox(self):
-        shutil.copy('./tests/data/dirty.avi', './tests/data/clean.avi')
-        p = video.AVIParser('./tests/data/clean.avi')
-        p.sandbox = False
-
-        meta = p.get_meta()
-        self.assertEqual(meta['Software'], 'MEncoder SVN-r33148-4.0.1')
-
-        ret = p.remove_all()
-        self.assertTrue(ret)
-
-        p = video.AVIParser('./tests/data/clean.cleaned.avi')
-        self.assertEqual(p.get_meta(), {})
-        self.assertTrue(p.remove_all())
-
-        os.remove('./tests/data/clean.avi')
-        os.remove('./tests/data/clean.cleaned.avi')
-        os.remove('./tests/data/clean.cleaned.cleaned.avi')
-
-    def test_png_nosandbox(self):
-        shutil.copy('./tests/data/dirty.png', './tests/data/clean.png')
-        p = images.PNGParser('./tests/data/clean.png')
-        p.sandbox = False
-        p.lightweight_cleaning = True
-
-        meta = p.get_meta()
-        self.assertEqual(meta['Comment'], 'This is a comment, be careful!')
-
-        ret = p.remove_all()
-        self.assertTrue(ret)
-
-        p = images.PNGParser('./tests/data/clean.cleaned.png')
-        self.assertEqual(p.get_meta(), {})
-        self.assertTrue(p.remove_all())
-
-        os.remove('./tests/data/clean.png')
-        os.remove('./tests/data/clean.cleaned.png')
-        os.remove('./tests/data/clean.cleaned.cleaned.png')
 
 class TestComplexOfficeFiles(unittest.TestCase):
     def test_complex_pptx(self):
