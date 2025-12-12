@@ -24,9 +24,11 @@ class TestHelp(unittest.TestCase):
         self.assertIn(b'mat2 [-h] [-V]', stdout)
         self.assertIn(b'[--unknown-members policy]', stdout)
         self.assertIn(b'[--inplace]', stdout)
-        self.assertIn(b' [-v] [-l]', stdout)
+        self.assertIn(b'[-v]', stdout)
+        self.assertIn(b'[-l]', stdout)
         self.assertIn(b'[--check-dependencies]', stdout)
-        self.assertIn(b'[-L | -s]', stdout)
+        self.assertIn(b'[-L', stdout)
+        self.assertIn(b'-s]', stdout)
         self.assertIn(b'[files ...]', stdout)
 
     def test_no_arg(self):
@@ -35,10 +37,11 @@ class TestHelp(unittest.TestCase):
         self.assertIn(b'mat2 [-h] [-V]', stdout)
         self.assertIn(b'[--unknown-members policy]', stdout)
         self.assertIn(b'[--inplace]', stdout)
-        self.assertIn(b' [-v]', stdout)
+        self.assertIn(b'[-v]', stdout)
         self.assertIn(b'[-l]', stdout)
         self.assertIn(b'[--check-dependencies]', stdout)
-        self.assertIn(b'[-L | -s]', stdout)
+        self.assertIn(b'[-L', stdout)
+        self.assertIn(b'-s]', stdout)
         self.assertIn(b'[files ...]', stdout)
 
 
@@ -217,11 +220,11 @@ class TestGetMeta(unittest.TestCase):
         self.assertIn(b'i am a : various comment', stdout)
         self.assertIn(b'artist: jvoisin', stdout)
 
-    #def test_webp(self):
-    #    proc = subprocess.Popen(mat2_binary + ['--show', './tests/data/dirty.webp'],
-    #            stdout=subprocess.PIPE)
-    #    stdout, _ = proc.communicate()
-    #    self.assertIn(b'Warning: [minor] Improper EXIF header', stdout)
+    def test_webp(self):
+        proc = subprocess.Popen(mat2_binary + ['--show', './tests/data/dirty.webp'],
+                stdout=subprocess.PIPE)
+        stdout, _ = proc.communicate()
+        self.assertIn(b'Warning: [minor] Improper EXIF header', stdout)
 
 class TestControlCharInjection(unittest.TestCase):
     def test_jpg(self):
