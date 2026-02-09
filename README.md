@@ -28,8 +28,8 @@ mat2 provides:
 - a service menu for Dolphin, KDE's default file manager
 
 If you prefer a regular graphical user interface, you might be interested in
-[Metadata Cleaner](https://metadatacleaner.romainvigier.fr/), which is using
-`mat2` under the hood.
+[Metadata Cleaner]( https://gitlab.com/metadatacleaner/metadatacleaner), which
+is using `mat2` under the hood.
 
 # Requirements
 
@@ -103,8 +103,8 @@ and [wp-mat-server](https://git.autistici.org/noblogs/wp-mat-server).
 
 ## Desktop GUI
 
-For GNU/Linux desktops, it's possible to use the
-[Metadata Cleaner](https://gitlab.com/rmnvgr/metadata-cleaner) GTK application.
+For GNU/Linux desktops, it's possible to use the [Metadata
+Cleaner](https://gitlab.com/metadatacleaner/metadatacleaner) GTK application.
 
 # Supported formats
 
