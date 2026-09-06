@@ -33,6 +33,7 @@ is using `mat2` under the hood.
 
 # Requirements
 
+- `python3.11` at least
 - `python3-mutagen` for audio support
 - `python3-gi-cairo` and `gir1.2-poppler-0.18` for PDF support
 - `gir1.2-gdkpixbuf-2.0` for images support
@@ -40,7 +41,8 @@ is using `mat2` under the hood.
 - `FFmpeg`, optionally, for video support
 - `libimage-exiftool-perl` for everything else
 
-Please note that mat2 requires at least Python3.5.
+The baseline for dependency versions is the current Debian oldstable, or
+Debian stable if oldstable is EOL.
 
 # Requirements setup on macOS (OS X) using [Homebrew](https://brew.sh/)
 
@@ -111,7 +113,7 @@ Cleaner](https://gitlab.com/metadatacleaner/metadatacleaner) GTK application.
 The following formats are supported: avi, bmp, css, epub/ncx, flac, gif, jpeg,
 m4a/mp2/mp3/…, mp4, odc/odf/odg/odi/odp/ods/odt/…, off/opus/oga/spx/…, pdf,
 png, ppm, pptx/xlsx/docx/…, svg/svgz/…, tar/tar.gz/tar.bz2/tar.xz/…, tiff,
-torrent, wav, wmv, zip, webp, …
+torrent, wav, wmv, zip, webp, avif, jxl, …
   
 # Notes about detecting metadata
 

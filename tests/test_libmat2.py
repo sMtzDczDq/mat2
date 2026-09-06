@@ -8,6 +8,10 @@ import sys
 import tarfile
 import tempfile
 import zipfile
+import xml.etree.ElementTree as ET
+
+import mutagen
+import mutagen.apev2
 
 from libmat2 import pdf, images, audio, office, parser_factory, torrent, harmless
 from libmat2 import check_dependencies, video, archive, web, epub
@@ -102,6 +106,9 @@ class TestGetMeta(unittest.TestCase):
         p = torrent.TorrentParser('./tests/data/dirty.torrent')
         meta = p.get_meta()
         self.assertEqual(meta['created by'], b'mktorrent 1.0')
+        # the tracker URL is kept, but must be reported since it can embed a
+        # private-tracker passkey
+        self.assertEqual(meta['announce'], b'udp://tracker.torrent.eu.org:451')
 
     def test_png(self):
         p = images.PNGParser('./tests/data/dirty.png')
@@ -119,12 +126,40 @@ class TestGetMeta(unittest.TestCase):
         meta = p.get_meta()
         self.assertEqual(meta['Warning'], '[minor] Improper EXIF header')
 
+    def test_avif(self):
+        p = images.AVIFParser('./tests/data/dirty.avif')
+        meta = p.get_meta()
+        self.assertEqual(meta['Artist'], 'jvoisin')
+        self.assertEqual(meta['Description'], 'This is a comment, be careful!')
+
+    def test_jxl(self):
+        p = images.JXLParser('./tests/data/dirty.jxl')
+        meta = p.get_meta()
+        self.assertEqual(meta['Artist'], 'jvoisin')
+        self.assertEqual(meta['Description'], 'This is a comment, be careful!')
+
     def test_ppm(self):
         p = images.PPMParser('./tests/data/dirty.ppm')
         meta = p.get_meta()
         self.assertEqual(meta['1'], '# A metadata')
         self.assertEqual(meta['4'], '# And an other one')
         self.assertEqual(meta['6'], '# and a final one here')
+
+        self.assertTrue(p.remove_all())
+        with open(p.output_filename, 'rb') as f:
+            self.assertEqual(f.read(), b'P3\n3 2 1\n'
+                             b'1 0 1   0 1 0   0 0 1\n'
+                             b'1 1 0   1 0 1   1 0 0\n\n')
+        os.remove(p.output_filename)
+
+        with tempfile.NamedTemporaryFile(suffix='.ppm') as binary:
+            binary.write(b'P6\n1 1\n255\n\x00#\xff')
+            binary.flush()
+            p = images.PPMParser(binary.name)
+            self.assertTrue(p.remove_all())
+            with open(p.output_filename, 'rb') as f:
+                self.assertEqual(f.read(), b'P6\n1 1\n255\n\x00#\xff')
+            os.remove(p.output_filename)
 
     def test_tiff(self):
         p = images.TiffParser('./tests/data/dirty.tiff')
@@ -284,6 +319,89 @@ class TestRemovingThumbnails(unittest.TestCase):
 
 
 class TestRevisionsCleaning(unittest.TestCase):
+    def test_msoffice_revision_metadata_in_non_document_part(self):
+        with tempfile.NamedTemporaryFile(suffix='.xml') as xml_file:
+            xml_file.write(b'''<?xml version="1.0"?>
+                                <wx:footnotes xmlns:wx="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+                                    <wx:footnote wx:id="1">
+                                        <wx:p><wx:del wx:id="2" wx:author="Reviewer" wx:date="2026-01-01T00:00:00Z"><wx:r><wx:delText>secret</wx:delText></wx:r></wx:del>
+                                        <wx:ins wx:id="3" wx:author="Reviewer" wx:date="2026-01-01T00:00:00Z"><wx:r><wx:t>kept</wx:t></wx:r></wx:ins>
+                                        <wx:rPrChange wx:id="4" wx:author="Reviewer" wx:date="2026-01-01T00:00:00Z"><wx:rPr><wx:b/></wx:rPr></wx:rPrChange></wx:p>
+                                    </wx:footnote>
+                                </wx:footnotes>''')
+            xml_file.flush()
+
+            self.assertTrue(office.MSOfficeParser._MSOfficeParser__remove_revisions(
+                xml_file.name))
+
+            with open(xml_file.name, 'rb') as cleaned:
+                content = cleaned.read()
+            self.assertNotIn(b'secret', content)
+            self.assertIn(b'kept', content)
+            self.assertNotIn(b'Reviewer', content)
+            self.assertNotIn(b'rPrChange', content)
+
+    def test_msoffice_randomize_creationId(self):
+        # A non-`p14` prefix on the powerpoint/2010 namespace to make sure the
+        # element is matched by its namespace URI, not the prefix convention.
+        with tempfile.NamedTemporaryFile(suffix='.xml') as xml_file:
+            xml_file.write(b'''<?xml version="1.0"?>
+                <p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+                                xmlns:foo="http://schemas.microsoft.com/office/powerpoint/2010/main">
+                    <foo:creationId val="123456789"/>
+                </p:presentation>''')
+            xml_file.flush()
+
+            self.assertTrue(office.MSOfficeParser._MSOfficeParser__randomize_creationId(
+                xml_file.name))
+
+            with open(xml_file.name, 'rb') as cleaned:
+                content = cleaned.read()
+            self.assertIn(b'creationId', content)
+            self.assertNotIn(b'123456789', content)
+
+    def test_msoffice_randomize_creationId_without_namespace(self):
+        # No powerpoint/2010 namespace: the method must be a no-op success.
+        with tempfile.NamedTemporaryFile(suffix='.xml') as xml_file:
+            xml_file.write(b'<?xml version="1.0"?><root><creationId val="1"/></root>')
+            xml_file.flush()
+
+            self.assertTrue(office.MSOfficeParser._MSOfficeParser__randomize_creationId(
+                xml_file.name))
+
+            with open(xml_file.name, 'rb') as cleaned:
+                self.assertIn(b'val="1"', cleaned.read())
+
+    def test_msoffice_randomize_sldMasterId(self):
+        # A non-`p` prefix on the presentationml namespace to make sure the
+        # element is matched by its namespace URI, not the prefix convention.
+        with tempfile.NamedTemporaryFile(suffix='.xml') as xml_file:
+            xml_file.write(b'''<?xml version="1.0"?>
+                <bar:presentation xmlns:bar="http://schemas.openxmlformats.org/presentationml/2006/main">
+                    <bar:sldMasterIdLst><bar:sldMasterId id="2147483648"/></bar:sldMasterIdLst>
+                </bar:presentation>''')
+            xml_file.flush()
+
+            self.assertTrue(office.MSOfficeParser._MSOfficeParser__randomize_sldMasterId(
+                xml_file.name))
+
+            with open(xml_file.name, 'rb') as cleaned:
+                content = cleaned.read()
+            self.assertIn(b'sldMasterId', content)
+            self.assertNotIn(b'2147483648', content)
+
+    def test_msoffice_randomize_sldMasterId_without_namespace(self):
+        # No presentationml namespace: the method must be a no-op success.
+        with tempfile.NamedTemporaryFile(suffix='.xml') as xml_file:
+            xml_file.write(b'<?xml version="1.0"?><root><sldMasterId id="1"/></root>')
+            xml_file.flush()
+
+            self.assertTrue(office.MSOfficeParser._MSOfficeParser__randomize_sldMasterId(
+                xml_file.name))
+
+            with open(xml_file.name, 'rb') as cleaned:
+                self.assertIn(b'id="1"', cleaned.read())
+
     def test_libreoffice(self):
         with zipfile.ZipFile('./tests/data/revision.odt') as zipin:
             c = zipin.open('content.xml')
@@ -295,12 +413,119 @@ class TestRevisionsCleaning(unittest.TestCase):
         self.assertTrue(p.remove_all())
 
         with zipfile.ZipFile('./tests/data/clean.cleaned.odt') as zipin:
+            self.assertNotIn('settings.xml', zipin.namelist())
             c = zipin.open('content.xml')
             r = c.read()
             self.assertNotIn(b'tracked-changes', r)
+            self.assertNotIn(b'change-info', r)
+            self.assertNotIn(b'Unknown Author', r)
+            self.assertNotIn(b'change-start', r)
+            self.assertNotIn(b'change-end', r)
 
         os.remove('./tests/data/clean.odt')
         os.remove('./tests/data/clean.cleaned.odt')
+
+    def test_libreoffice_spreadsheet_revisions(self):
+        with tempfile.NamedTemporaryFile(suffix='.xml') as xml_file:
+            xml_file.write(b'''<?xml version="1.0"?>
+                                <office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+                                    <office:body><office:spreadsheet>
+                                        <table:tracked-changes><table:cell-content-change table:id="ct1">
+                                            <office:change-info><dc:creator>Reviewer</dc:creator><dc:date>2026-01-01T00:00:00</dc:date></office:change-info>
+                                            <table:previous><table:change-track-table-cell><text:p>secret</text:p></table:change-track-table-cell></table:previous>
+                                        </table:cell-content-change></table:tracked-changes>
+                                        <table:table table:name="Sheet1"><table:table-row><table:table-cell><text:p>kept</text:p></table:table-cell></table:table-row></table:table>
+                                    </office:spreadsheet></office:body>
+                                </office:document-content>''')
+            xml_file.flush()
+
+            self.assertTrue(office.LibreOfficeParser._LibreOfficeParser__remove_revisions(
+                xml_file.name))
+
+            with open(xml_file.name, 'rb') as cleaned:
+                content = cleaned.read()
+            self.assertNotIn(b'tracked-changes', content)
+            self.assertNotIn(b'Reviewer', content)
+            self.assertNotIn(b'secret', content)
+            self.assertIn(b'kept', content)
+
+    def test_libreoffice_revisions_keep_inserted_text(self):
+        with tempfile.NamedTemporaryFile(suffix='.xml') as xml_file:
+            xml_file.write(b'''<?xml version="1.0"?>
+                                <office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+                                    <office:body><office:text>
+                                        <text:tracked-changes><text:changed-region text:id="ct1"><text:insertion>
+                                            <office:change-info><dc:creator>Reviewer</dc:creator><dc:date>2026-01-01T00:00:00</dc:date></office:change-info>
+                                        </text:insertion></text:changed-region></text:tracked-changes>
+                                        <text:p>Before <text:change-start text:change-id="ct1"/>inserted words<text:change-end text:change-id="ct1"/> after</text:p>
+                                    </office:text></office:body>
+                                </office:document-content>''')
+            xml_file.flush()
+
+            self.assertTrue(office.LibreOfficeParser._LibreOfficeParser__remove_revisions(
+                xml_file.name))
+
+            with open(xml_file.name, 'rb') as cleaned:
+                content = cleaned.read()
+            self.assertNotIn(b'tracked-changes', content)
+            self.assertNotIn(b'change-start', content)
+            self.assertNotIn(b'change-end', content)
+            self.assertNotIn(b'Reviewer', content)
+            # the inserted text and the text around the markers is document
+            # content, and must survive the removal of the inline markers
+            self.assertIn(b'Before', content)
+            self.assertIn(b'inserted words', content)
+            self.assertIn(b'after', content)
+
+    def test_libreoffice_annotations(self):
+        with tempfile.NamedTemporaryFile(suffix='.xml') as xml_file:
+            xml_file.write(b'''<?xml version="1.0"?>
+                                <office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:meta="urn:oasis:names:tc:opendocument:xmlns:meta:1.0" xmlns:loext="urn:oasis:names:tc:openoffice:xmlns:loext:1.0">
+                                    <office:body><office:text><text:p>
+                                        <office:annotation office:name="a1"><dc:creator>Reviewer</dc:creator><dc:date>2026-01-01T00:00:00</dc:date><meta:date-string>January 1, 2026</meta:date-string><loext:sender-initials>RV</loext:sender-initials><text:p>comment body</text:p></office:annotation>
+                                        <office:annotation-end office:name="a1"/>visible</text:p></office:text></office:body>
+                                </office:document-content>''')
+            xml_file.flush()
+
+            self.assertTrue(office.LibreOfficeParser._LibreOfficeParser__remove_annotations(
+                xml_file.name))
+
+            with open(xml_file.name, 'rb') as cleaned:
+                content = cleaned.read()
+            self.assertNotIn(b'Reviewer', content)
+            self.assertNotIn(b'January 1, 2026', content)
+            # ODF 1.2 Extended, the common LibreOffice format, stores comment
+            # initials as `loext:sender-initials`; they must be gone too
+            self.assertNotIn(b'sender-initials', content)
+            self.assertNotIn(b'RV', content)
+            # the whole comment is dropped, along with its paired end marker
+            self.assertNotIn(b'comment body', content)
+            self.assertNotIn(b'annotation', content)
+            # but the commented-on document text must be preserved
+            self.assertIn(b'visible', content)
+
+    def test_libreoffice_annotations_keep_mathml(self):
+        # An embedded formula object is stored as `Object N/content.xml`, so it
+        # goes through the same cleanup; MathML's `annotation` holds the formula
+        # source and must not be mistaken for an ODF comment `office:annotation`.
+        with tempfile.NamedTemporaryFile(suffix='.xml') as xml_file:
+            xml_file.write(b'''<?xml version="1.0"?>
+                                <math xmlns="http://www.w3.org/1998/Math/MathML">
+                                    <semantics>
+                                        <mrow><msup><mi>x</mi><mn>2</mn></msup></mrow>
+                                        <annotation encoding="StarMath 5.0">x^2</annotation>
+                                    </semantics>
+                                </math>''')
+            xml_file.flush()
+
+            self.assertTrue(office.LibreOfficeParser._LibreOfficeParser__remove_annotations(
+                xml_file.name))
+
+            with open(xml_file.name, 'rb') as cleaned:
+                content = cleaned.read()
+            self.assertIn(b'annotation', content)
+            self.assertIn(b'x^2', content)
+            self.assertIn(b'msup', content)
 
     def test_msoffice(self):
         with zipfile.ZipFile('./tests/data/revision.docx') as zipin:
@@ -322,13 +547,122 @@ class TestRevisionsCleaning(unittest.TestCase):
         os.remove('./tests/data/revision_clean.docx')
         os.remove('./tests/data/revision_clean.cleaned.docx')
 
+    def test_msoffice_move(self):
+        with zipfile.ZipFile('./tests/data/revision_move.docx') as zipin:
+            c = zipin.open('word/document.xml')
+            content = c.read()
+            r = b'<w:moveFrom w:id="31" w:author="Alice Reviewer" w:date="2026-01-02T10:00:00Z">'
+            self.assertIn(r, content)
+
+        shutil.copy('./tests/data/revision_move.docx', './tests/data/revision_move_clean.docx')
+        p = office.MSOfficeParser('./tests/data/revision_move_clean.docx')
+        self.assertTrue(p.remove_all())
+
+        with zipfile.ZipFile('./tests/data/revision_move_clean.cleaned.docx') as zipin:
+            c = zipin.open('word/document.xml')
+            content = c.read()
+            self.assertNotIn(b'moveFrom', content)
+            self.assertNotIn(b'moveTo', content)
+            self.assertNotIn(b'Alice Reviewer', content)
+            # The moved text is kept, once, at the destination, and the run
+            # that followed the `w:moveTo` is still after it.
+            self.assertEqual(content.count(b'The budget figures are confidential.'), 1)
+            self.assertLess(content.index(b'The budget figures are confidential.'),
+                            content.index(b'Trailing text stays last.'))
+            self.assertNotIn(b'move12345', content)
+            # the moved text is part of the document, only the copy that the
+            # move left behind at its source has to go
+            self.assertEqual(content.count(b'The budget figures are confidential.'), 1)
+
+        os.remove('./tests/data/revision_move_clean.docx')
+        os.remove('./tests/data/revision_move_clean.cleaned.docx')
+
+
+class TestAppendedTagsCleaning(unittest.TestCase):
+    """ APEv2 and ID3v1 blocks are appended after the audio data, and aren't
+    the primary tag of any of those containers. """
+
+    @staticmethod
+    def __append_apev2(filename: str) -> None:
+        tag = mutagen.apev2.APEv2()
+        tag['Artist'] = 'jvoisin'
+        tag['Comment'] = 'I am an appended tag'
+        tag.save(filename)
+
+    @staticmethod
+    def __append_id3v1(filename: str) -> None:
+        # mutagen refuses to write ID3 on non-ID3 containers, hence the
+        # handrolled 128 bytes: TAG, title, artist, album, year, comment, genre
+        tag = b'TAG'
+        for value, size in (('I am so', 30), ('jvoisin', 30), ('harmfull', 30),
+                            ('1337', 4), ('I am an appended tag', 30)):
+            tag += value.encode('utf-8').ljust(size, b'\x00')
+        with open(filename, 'ab') as f:
+            f.write(tag + b'\xff')
+
+    def __leftovers(self, extension: str, parser, append, needles) -> list:
+        """ Clean a file carrying an appended tag, and return the needles that
+        are still in it. Printing the whole file on failure isn't helpful. """
+        target = './tests/data/appended.' + extension
+        shutil.copy('./tests/data/dirty.' + extension, target)
+        append(target)
+
+        p = parser(target)
+        self.assertTrue(p.remove_all())
+
+        with open(p.output_filename, 'rb') as f:
+            content = f.read()
+
+        # the cleaned file must still be a readable audio file
+        self.assertIsNotNone(mutagen.File(p.output_filename))
+
+        os.remove(target)
+        os.remove(p.output_filename)
+        return [n.decode('utf-8') for n in needles if n in content]
+
+    def test_apev2(self):
+        needles = (b'APETAGEX', b'I am an appended tag')
+        for extension, parser in (('mp3', audio.MP3Parser),
+                                  ('ogg', audio.OGGParser),
+                                  ('flac', audio.FLACParser)):
+            with self.subTest(extension=extension):
+                left = self.__leftovers(extension, parser,
+                                        self.__append_apev2, needles)
+                self.assertEqual(left, [])
+
+    def test_id3v1(self):
+        needles = (b'I am an appended tag', )
+        for extension, parser in (('ogg', audio.OGGParser),
+                                  ('flac', audio.FLACParser)):
+            with self.subTest(extension=extension):
+                left = self.__leftovers(extension, parser,
+                                        self.__append_id3v1, needles)
+                self.assertEqual(left, [])
+
+    def test_vendor_string(self):
+        for extension, parser in (('ogg', audio.OGGParser),
+                                  ('flac', audio.FLACParser)):
+            with self.subTest(extension=extension):
+                target = './tests/data/vendor.' + extension
+                shutil.copy('./tests/data/dirty.' + extension, target)
+
+                self.assertNotEqual(mutagen.File(target).tags.vendor, '')
+
+                p = parser(target)
+                self.assertTrue(p.remove_all())
+
+                self.assertEqual(mutagen.File(p.output_filename).tags.vendor, '')
+
+                os.remove(target)
+                os.remove(p.output_filename)
+
 
 class TestCleaning(unittest.TestCase):
     data = [{
         'name': 'pdf',
         'parser': pdf.PDFParser,
         'meta': {'producer': 'pdfTeX-1.40.14'},
-        'expected_meta': {'creation-date': -1, 'format': 'PDF-1.4', 'mod-date': -1},
+        'expected_meta': {'creation-date': -1, 'format': 'PDF-1.5', 'mod-date': -1},
         }, {
             'name': 'png',
             'parser': images.PNGParser,
@@ -406,15 +740,24 @@ class TestCleaning(unittest.TestCase):
                   'XResolution': 72,
                   'YResolution': 72}
         },{
-            'name': 'bmp',
-            'parser': harmless.HarmlessParser,
-            'meta': {},
+            'name': 'avif',
+            'parser': images.AVIFParser,
+            'meta': {'Description': 'This is a comment, be careful!'},
+            'expected_meta': {},
+        },{
+            'name': 'jxl',
+            'parser': images.JXLParser,
+            'meta': {'Description': 'This is a comment, be careful!'},
             'expected_meta': {},
         },{
             'name': 'torrent',
             'parser': torrent.TorrentParser,
             'meta': {'created by': b'mktorrent 1.0', 'creation date': 1522397702},
-            'expected_meta': {},
+            'expected_meta': {
+                'announce': b'udp://tracker.torrent.eu.org:451',
+                'announce-list': [[b'udp://tracker.torrent.eu.org:451'],
+                                  [b'udp://tracker.coppersurfer.tk:6969']],
+            },
         }, {
             'name': 'odf',
             'parser': office.LibreOfficeParser,
@@ -441,6 +784,11 @@ class TestCleaning(unittest.TestCase):
             'name': 'txt',
             'parser': harmless.HarmlessParser,
             'meta': {},
+            'expected_meta': {},
+        },{
+            'name': 'bmp',
+            'parser': images.BMPParser,
+            'meta': {'Comment': 'Created with GIMP'},
             'expected_meta': {},
         },{
             'name': 'gif',
@@ -532,47 +880,6 @@ class TestCleaning(unittest.TestCase):
                 'EncodingSettings': 'Lavf52.103.0',
             },
             'expected_meta': {},
-        },{
-            'name': 'heic',
-            'parser': images.HEICParser,
-            'meta': {},
-            'expected_meta': {
-                'BlueMatrixColumn': '0.14305 0.06061 0.71393',
-                'BlueTRC': '(Binary data 32 bytes, use -b option to extract)',
-                'CMMFlags': 'Not Embedded, Independent',
-                'ChromaticAdaptation': '1.04788 0.02292 -0.05022 0.02959 0.99048 -0.01707 -0.00925 0.01508 0.75168',
-                'ChromaticityChannel1': '0.64 0.33002',
-                'ChromaticityChannel2': '0.3 0.60001',
-                'ChromaticityChannel3': '0.15001 0.06',
-                'ChromaticityChannels': 3,
-                'ChromaticityColorant': 'Unknown',
-                'ColorSpaceData': 'RGB ',
-                'ConnectionSpaceIlluminant': '0.9642 1 0.82491',
-                'DeviceAttributes': 'Reflective, Glossy, Positive, Color',
-                'DeviceManufacturer': '',
-                'DeviceMfgDesc': 'GIMP',
-                'DeviceModel': '',
-                'DeviceModelDesc': 'sRGB',
-                'ExifByteOrder': 'Big-endian (Motorola, MM)',
-                'GreenMatrixColumn': '0.38512 0.7169 0.09706',
-                'GreenTRC': '(Binary data 32 bytes, use -b option to extract)',
-                'MediaWhitePoint': '0.9642 1 0.82491',
-                'PrimaryPlatform': 'Apple Computer Inc.',
-                'ProfileCMMType': 'Little CMS',
-                'ProfileClass': 'Display Device Profile',
-                'ProfileConnectionSpace': 'XYZ ',
-                'ProfileCopyright': 'Public Domain',
-                'ProfileCreator': 'Little CMS',
-                'ProfileDateTime': '2022:05:15 16:29:22',
-                'ProfileDescription': 'GIMP built-in sRGB',
-                'ProfileFileSignature': 'acsp',
-                'ProfileID': 0,
-                'ProfileVersion': '4.3.0',
-                'RedMatrixColumn': '0.43604 0.22249 0.01392',
-                'RedTRC': '(Binary data 32 bytes, use -b option to extract)',
-                'RenderingIntent': 'Perceptual',
-                'Warning': 'Bad IFD0 directory',
-            },
         }
         ]
 
@@ -619,6 +926,22 @@ class TestCleaning(unittest.TestCase):
                 os.remove(target)
                 os.remove(p1.output_filename)
                 os.remove(p2.output_filename)
+
+
+    def test_heic(self):
+        shutil.copy('./tests/data/dirty.heic', './tests/data/clean.heic')
+
+        # HEIC can't be thoroughly cleaned, so it must refuse in normal mode.
+        p = images.HEICParser('./tests/data/clean.heic')
+        with self.assertRaises(RuntimeError):
+            p.remove_all()
+
+        # but lightweight cleaning is still supported.
+        p.lightweight_cleaning = True
+        self.assertTrue(p.remove_all())
+
+        os.remove('./tests/data/clean.heic')
+        os.remove('./tests/data/clean.cleaned.heic')
 
 
     def test_html(self):
@@ -672,6 +995,19 @@ class TestCleaning(unittest.TestCase):
         os.remove('./tests/data/clean.html')
         os.remove('./tests/data/clean.cleaned.html')
 
+        # `<meta charset="utf-8">` without a self-closing slash is how every
+        # non-XHTML HTML5 document spells it; it must not blow up mat2, nor
+        # make it silently drop everything coming after it.
+        with open('./tests/data/clean.html', 'w') as f:
+            f.write('<html><head><meta charset="utf-8"></head>'
+                    '<body>secret content</body></html>')
+        p = web.HTMLParser('./tests/data/clean.html')
+        self.assertTrue(p.remove_all())
+        with open('./tests/data/clean.cleaned.html', 'r') as f:
+            self.assertEqual(f.read(), '<html><head></head><body>secret content</body></html>')
+        os.remove('./tests/data/clean.html')
+        os.remove('./tests/data/clean.cleaned.html')
+
     def test_epub(self):
         shutil.copy('./tests/data/dirty.epub', './tests/data/clean.epub')
         p = epub.EPUBParser('./tests/data/clean.epub')
@@ -684,14 +1020,40 @@ class TestCleaning(unittest.TestCase):
 
         p = epub.EPUBParser('./tests/data/clean.cleaned.epub')
         meta = p.get_meta()
-        res = re.match(meta['OEBPS/content.opf']['metadata'], '^<dc:identifier>[0-9a-f-]+</dc:identifier><dc:title /><dc:language />$')
-        self.assertNotEqual(res, False)
+        self.assertIn('id="id"', meta['OEBPS/content.opf']['metadata'])
+        self.assertIn('urn:uuid:00000000-0000-0000-0000-000000000000',
+                  meta['OEBPS/content.opf']['metadata'])
+        self.assertIn('<dc:language>und</dc:language>',
+                  meta['OEBPS/content.opf']['metadata'])
+        self.assertIn('<dc:title>Untitled</dc:title>',
+                  meta['OEBPS/content.opf']['metadata'])
 
         self.assertTrue(p.remove_all())
+        p3 = epub.EPUBParser('./tests/data/clean.cleaned.cleaned.epub')
+        self.assertEqual(meta['OEBPS/content.opf']['metadata'],
+                 p3.get_meta()['OEBPS/content.opf']['metadata'])
 
         os.remove('./tests/data/clean.epub')
         os.remove('./tests/data/clean.cleaned.epub')
         os.remove('./tests/data/clean.cleaned.cleaned.epub')
+
+    def test_epub_preserves_unique_identifier_target(self):
+        opf = ('<package xmlns="http://www.idpf.org/2007/opf" '
+               'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+               'unique-identifier="BookId"><metadata>'
+               '<dc:identifier id="BookId">secret</dc:identifier>'
+               '</metadata></package>')
+        parser = epub.EPUBParser('./tests/data/dirty.epub')
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.opf') as f:
+            f.write(opf)
+            f.flush()
+            self.assertTrue(parser._EPUBParser__handle_contentopf(f.name))
+            root = ET.parse(f.name).getroot()
+            identifier = root.find('{http://www.idpf.org/2007/opf}metadata/'
+                                  '{http://purl.org/dc/elements/1.1/}identifier')
+            self.assertEqual(root.attrib['unique-identifier'], 'BookId')
+            self.assertEqual(identifier.attrib['id'], 'BookId')
+            self.assertEqual(identifier.text, epub.EPUBParser.sanitized_identifier)
 
 
 class TestCleaningArchives(unittest.TestCase):
@@ -883,6 +1245,44 @@ class TestCleaningArchives(unittest.TestCase):
         os.remove('./tests/data/dirty.cleaned.cleaned.tar.xz')
 
 
+class TestXmlAttributeSorting(unittest.TestCase):
+    """ OOXML schemas are sequences: the order of the elements carries meaning,
+    only the order of the attributes doesn't. """
+
+    def test_attributes_are_sorted(self):
+        with tempfile.NamedTemporaryFile(suffix='.xml') as f:
+            f.write(b'<r><e z="1" a="2" m="3"/></r>')
+            f.flush()
+            self.assertTrue(office._sort_xml_attributes(f.name))
+            with open(f.name, 'rb') as g:
+                self.assertIn(b'<e a="2" m="3" z="1"', g.read())
+
+    def test_element_order_is_kept(self):
+        with tempfile.NamedTemporaryFile(suffix='.xml') as f:
+            f.write(b'<document><body><p/><tbl/><p/><sectPr/></body></document>')
+            f.flush()
+            self.assertTrue(office._sort_xml_attributes(f.name))
+            with open(f.name, 'rb') as g:
+                content = g.read()
+            self.assertEqual(re.findall(rb'<(\w+)\s*/>', content),
+                             [b'p', b'tbl', b'p', b'sectPr'])
+
+    def test_pptx_slide_layout_is_preserved(self):
+        # <p:cSld> is a sequence, <p:spTree> comes before <p:extLst>
+        target = './tests/data/ordering.pptx'
+        shutil.copy('./tests/data/narrated_powerpoint_presentation.pptx', target)
+        p = office.MSOfficeParser(target)
+        self.assertTrue(p.remove_all())
+
+        with zipfile.ZipFile(p.output_filename) as zipin:
+            slide = zipin.read('ppt/slides/slide1.xml')
+        self.assertEqual(re.findall(rb'<p:(spTree|extLst)[ />]', slide)[:2],
+                         [b'spTree', b'extLst'])
+
+        os.remove(target)
+        os.remove(p.output_filename)
+
+
 class TestComplexOfficeFiles(unittest.TestCase):
     def test_complex_pptx(self):
         target = './tests/data/clean.pptx'
@@ -909,6 +1309,53 @@ class TextDocx(unittest.TestCase):
 
         os.remove('./tests/data/comment_clean.docx')
         os.remove('./tests/data/comment_clean.cleaned.docx')
+
+    def test_comment_anchors_removed_from_non_document_parts(self):
+        # Comment anchors can live in headers, footers, foot/endnotes too, not
+        # only in word/document.xml. Inject a kept footnotes part carrying
+        # anchors and make sure they get stripped there as well.
+        src = './tests/data/comment.docx'
+        work = './tests/data/comment_footnotes.docx'
+        footnotes = (
+            b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            b'<w:footnotes xmlns:w="http://schemas.openxmlformats.org/'
+            b'wordprocessingml/2006/main">'
+            b'<w:footnote w:id="1"><w:p>'
+            b'<w:commentRangeStart w:id="0"/>'
+            b'<w:r><w:t>footnote text</w:t></w:r>'
+            b'<w:commentRangeEnd w:id="0"/>'
+            b'<w:r><w:commentReference w:id="0"/></w:r>'
+            b'</w:p></w:footnote></w:footnotes>'
+        )
+        override = (
+            b'<Override PartName="/word/footnotes.xml" '
+            b'ContentType="application/vnd.openxmlformats-officedocument.'
+            b'wordprocessingml.footnotes+xml"/>'
+        )
+        with zipfile.ZipFile(src) as zin:
+            with zipfile.ZipFile(work, 'w') as zout:
+                for name in zin.namelist():
+                    data = zin.read(name)
+                    if name == '[Content_Types].xml':
+                        data = data.replace(b'</Types>', override + b'</Types>')
+                    zout.writestr(name, data)
+                zout.writestr('word/footnotes.xml', footnotes)
+
+        self.addCleanup(os.remove, work)
+        p = office.MSOfficeParser(work)
+        self.addCleanup(os.remove, p.output_filename)
+        self.assertTrue(p.remove_all())
+
+        with zipfile.ZipFile(p.output_filename) as zipin:
+            # the part must be kept, not merely dropped from the archive
+            self.assertIn('word/footnotes.xml', zipin.namelist())
+            content = zipin.read('word/footnotes.xml')
+
+        self.assertNotIn(b'commentReference', content)
+        self.assertNotIn(b'commentRangeStart', content)
+        self.assertNotIn(b'commentRangeEnd', content)
+        # the footnote text itself must survive
+        self.assertIn(b'footnote text', content)
 
     def test_xml_is_utf8(self):
         with zipfile.ZipFile('./tests/data/comment.docx') as zipin:
@@ -986,3 +1433,69 @@ class TextDocx(unittest.TestCase):
         os.remove('./tests/data/comment_clean.docx')
         os.remove('./tests/data/comment_clean.cleaned.docx')
 
+
+
+class TestDanglingRelationships(unittest.TestCase):
+    """A relationship whose target isn't in the package makes the whole
+    document unreadable, so cleaning must drop the relationship along with
+    the part it points to."""
+
+    @staticmethod
+    def __dangling_relationships(path):
+        import posixpath
+        ns = '{http://schemas.openxmlformats.org/package/2006/relationships}'
+        dangling = []
+        with zipfile.ZipFile(path) as zipin:
+            names = set(zipin.namelist())
+            for rels in (n for n in names if n.endswith('.rels')):
+                base = posixpath.dirname(posixpath.dirname(rels))
+                for rel in ET.fromstring(zipin.read(rels)).iter(ns + 'Relationship'):
+                    if rel.get('TargetMode') == 'External':
+                        continue
+                    target = rel.get('Target', '').split('#', 1)[0]
+                    if not target:  # a link to a bookmark, not to a part
+                        continue
+                    if target.startswith('/'):
+                        resolved = target[1:]
+                    else:
+                        resolved = posixpath.normpath(posixpath.join(base, target))
+                    if resolved not in names:
+                        dangling.append((rels, rel.get('Id'), target))
+        return dangling
+
+    def __clean(self, name):
+        shutil.copy('./tests/data/%s' % name, './tests/data/clean_%s' % name)
+        p = office.MSOfficeParser('./tests/data/clean_%s' % name)
+        self.assertTrue(p.remove_all())
+        return './tests/data/clean_%s' % name, p.output_filename
+
+    def test_docx(self):
+        # the fixture points at customXml with a `../` target and at
+        # docProps/custom.xml from the package-root _rels/.rels
+        self.assertEqual(self.__dangling_relationships('./tests/data/dangling_rels.docx'), [])
+
+        source, cleaned = self.__clean('dangling_rels.docx')
+        with zipfile.ZipFile(cleaned) as zipin:
+            names = zipin.namelist()
+        self.assertNotIn('customXml/item1.xml', names)
+        self.assertNotIn('docProps/custom.xml', names)
+        self.assertEqual(self.__dangling_relationships(cleaned), [])
+
+        os.remove(source)
+        os.remove(cleaned)
+
+    def test_xlsx(self):
+        self.assertEqual(self.__dangling_relationships('./tests/data/dangling_rels.xlsx'), [])
+
+        source, cleaned = self.__clean('dangling_rels.xlsx')
+        with zipfile.ZipFile(cleaned) as zipin:
+            names = zipin.namelist()
+            sheet = zipin.read('xl/worksheets/sheet1.xml')
+        self.assertNotIn('customXml/item1.xml', names)
+        self.assertNotIn('xl/printerSettings/printerSettings1.bin', names)
+        self.assertEqual(self.__dangling_relationships(cleaned), [])
+        # the sheet used to reference the printer settings by relationship id
+        self.assertNotIn(b'r:id', sheet)
+
+        os.remove(source)
+        os.remove(cleaned)

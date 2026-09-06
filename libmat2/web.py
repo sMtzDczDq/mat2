@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from html import parser, escape
-from typing import Any, Optional, Dict, List, Tuple, Set
+from typing import Any
 import re
 import string
 
@@ -11,7 +13,7 @@ from . import abstract
 class CSSParser(abstract.AbstractParser):
     """There is no such things as metadata in CSS files,
     only comments of the form `/* … */`, so we're removing the laters."""
-    mimetypes = {'text/css', }
+    mimetypes = frozenset({'text/css', })
     flags = re.MULTILINE | re.DOTALL
 
     def remove_all(self) -> bool:
@@ -25,7 +27,7 @@ class CSSParser(abstract.AbstractParser):
             f.write(cleaned)
         return True
 
-    def get_meta(self) -> Dict[str, Any]:
+    def get_meta(self) -> dict[str, Any]:
         metadata = {}
         with open(self.filename, encoding='utf-8') as f:
             try:
@@ -44,10 +46,10 @@ class CSSParser(abstract.AbstractParser):
 
 
 class AbstractHTMLParser(abstract.AbstractParser):
-    tags_blocklist: Set[str] = set()
+    tags_blocklist: frozenset[str] = frozenset()
     # In some html/xml-based formats some tags are mandatory,
     # so we're keeping them, but are discarding their content
-    tags_required_blocklist: Set[str] = set()
+    tags_required_blocklist: frozenset[str] = frozenset()
 
     def __init__(self, filename):
         super().__init__(filename)
@@ -57,7 +59,7 @@ class AbstractHTMLParser(abstract.AbstractParser):
             self.__parser.feed(f.read())
         self.__parser.close()
 
-    def get_meta(self) -> Dict[str, Any]:
+    def get_meta(self) -> dict[str, Any]:
         return self.__parser.get_meta()
 
     def remove_all(self) -> bool:
@@ -65,14 +67,26 @@ class AbstractHTMLParser(abstract.AbstractParser):
 
 
 class HTMLParser(AbstractHTMLParser):
-    mimetypes = {'text/html', 'application/xhtml+xml'}
-    tags_blocklist = {'meta', }
-    tags_required_blocklist = {'title', }
+    mimetypes = frozenset({'text/html', 'application/xhtml+xml'})
+    tags_blocklist = frozenset({'meta', })
+    tags_required_blocklist = frozenset({'title', })
 
 
 class DTBNCXParser(AbstractHTMLParser):
-    mimetypes = {'application/x-dtbncx+xml', }
-    tags_required_blocklist = {'title', 'doctitle', 'meta'}
+    mimetypes = frozenset({'application/x-dtbncx+xml', })
+    tags_required_blocklist = frozenset({'title', 'doctitle', 'meta'})
+
+
+# Void elements don't need a closing tag (https://html.spec.whatwg.org/#void-elements):
+# a real-world, non-XHTML document writes `<meta charset="utf-8">`, not
+# `<meta charset="utf-8" />`. `handle_starttag` pushes every opening tag on
+# the validation queue expecting a matching `handle_endtag`, so a bare one of
+# these left mat2 unable to process such a common, valid document at all: the
+# closing tag of an ancestor (eg. `</head>`) would be compared against the
+# unclosed `meta`/`br`/… still sitting on top of the queue, and raise.
+_VOID_ELEMENTS = frozenset({'area', 'base', 'br', 'col', 'embed', 'hr', 'img',
+                            'input', 'link', 'meta', 'param', 'source',
+                            'track', 'wbr'})
 
 
 class _HTMLParser(parser.HTMLParser):
@@ -91,7 +105,7 @@ class _HTMLParser(parser.HTMLParser):
         self.filename = filename
         self.__textrepr = ''
         self.__meta = {}
-        self.__validation_queue: List[str] = list()
+        self.__validation_queue: list[str] = list()
 
         # We're using counters instead of booleans, to handle nested tags
         self.__in_dangerous_but_required_tag = 0
@@ -112,7 +126,7 @@ class _HTMLParser(parser.HTMLParser):
         """
         raise ValueError(message)
 
-    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]):
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]):
         # Ignore the type, because mypy is too stupid to infer
         # that get_starttag_text() can't return None.
         original_tag = self.get_starttag_text()  # type: ignore
@@ -136,10 +150,29 @@ class _HTMLParser(parser.HTMLParser):
         previous_tag = self.__validation_queue.pop()
         previous_tag = previous_tag[1:-1]  # remove < and >
         previous_tag = previous_tag.split(' ')[0]  # remove attributes
+
         if tag != previous_tag.lower():
+            if previous_tag.lower() in _VOID_ELEMENTS:
+                # A void element (eg. a bare `<meta charset="utf-8">`) never
+                # gets its own closing tag in real-world HTML, so close it
+                # here instead of raising on the closing tag of one of its
+                # ancestors. It can still be closed explicitly, like above,
+                # for the (unusual, but tolerated) documents that do so.
+                self.__close_tag(previous_tag)
+                self.handle_endtag(tag)
+                return
             raise ValueError("The closing tag %s doesn't match the previous "
                              "tag %s in %s" %
                              (tag, previous_tag, self.filename))
+
+        self.__close_tag(previous_tag)
+
+    def __close_tag(self, previous_tag: str) -> None:
+        """ Apply the bookkeeping triggered by a closing tag, given
+        `previous_tag` (in its original case, as written on the matching
+        opening tag): either a real one, or a void element's implicit one.
+        """
+        tag = previous_tag.lower()
 
         if tag in self.tag_required_blocklist:
             self.__in_dangerous_but_required_tag -= 1
@@ -159,7 +192,7 @@ class _HTMLParser(parser.HTMLParser):
                     self.__textrepr += escape(data)
 
     def handle_startendtag(self, tag: str,
-                           attrs: List[Tuple[str, Optional[str]]]):
+                           attrs: list[tuple[str, str | None]]):
         if tag in self.tag_required_blocklist | self.tag_blocklist:
             meta = {k:v for k, v in attrs}
             name = meta.get('name', 'harmful metadata')
@@ -184,7 +217,7 @@ class _HTMLParser(parser.HTMLParser):
             f.write(self.__textrepr)
         return True
 
-    def get_meta(self) -> Dict[str, Any]:
+    def get_meta(self) -> dict[str, Any]:
         if self.__validation_queue:
             raise ValueError("Some tags (%s) were left unclosed in %s" % (
                 ', '.join(self.__validation_queue),

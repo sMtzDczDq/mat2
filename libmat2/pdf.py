@@ -1,6 +1,8 @@
 """ Handle PDF
 
 """
+from __future__ import annotations
+
 __lazy_modules__ = ['cairo', 'gi']
 
 import os
@@ -8,7 +10,6 @@ import re
 import logging
 import tempfile
 import io
-from typing import Union, Dict
 
 import cairo
 import gi
@@ -30,24 +31,25 @@ class PDFParser(abstract.AbstractParser):
         self.__scale = 200 / 72.0  # how much precision do we want for the render
         try:  # Check now that the file is valid, to avoid surprises later
             document = Poppler.Document.new_from_file(self.uri, None)
-            self.pdf_version = self.__pdf_version_to_cairo(document.get_pdf_version())
+            major, minor = document.get_pdf_version()
+            self.pdf_version = self.__pdf_version_to_cairo(major, minor)
         except GLib.GError as e:  # Invalid PDF
             raise ValueError(e)
 
+    @staticmethod
     def __pdf_version_to_cairo(major: int, minor: int) -> cairo.PDFVersion:
         """
-            Convert a PDF version to the cairo.PDFVersion enum.
+            Convert a PDF version to the closest cairo.PDFVersion enum. cairo
+            can't produce anything newer than PDF 1.7 (eg. PDF 2.0), so those
+            are capped to the highest version it supports.
         """
-        if major == 1:
-            if minor == 4:
-                return cairo.PDFVersion(0)
-            elif minor == 5:
-                return cairo.PDFVersion(1)
-            elif minor == 6:
-                return cairo.PDFVersion(2)
-            elif minor == 7:
-                return cairo.PDFVersion(3)
-        return cairo.PDFVersion(0)
+        if major == 1 and minor == 5:
+            return cairo.PDFVersion.VERSION_1_5
+        elif major == 1 and minor == 6:
+            return cairo.PDFVersion.VERSION_1_6
+        elif (major, minor) >= (1, 7):
+            return cairo.PDFVersion.VERSION_1_7
+        return cairo.PDFVersion.VERSION_1_4
 
     def remove_all(self) -> bool:
         if self.lightweight_cleaning is True:
@@ -66,6 +68,8 @@ class PDFParser(abstract.AbstractParser):
 
         tmp_path = tempfile.mkstemp()[1]
         pdf_surface = cairo.PDFSurface(tmp_path, 10, 10)  # resized later anyway
+        pdf_surface.set_metadata(cairo.PDF_METADATA_CREATE_DATE, '')
+        pdf_surface.set_metadata(cairo.PDF_METADATA_CREATOR, '')
         pdf_surface.restrict_to_version(self.pdf_version)
         pdf_context = cairo.Context(pdf_surface)  # context draws on the surface
 
@@ -95,6 +99,8 @@ class PDFParser(abstract.AbstractParser):
 
         _, tmp_path = tempfile.mkstemp()
         pdf_surface = cairo.PDFSurface(tmp_path, 32, 32)  # resized later anyway
+        pdf_surface.set_metadata(cairo.PDF_METADATA_CREATE_DATE, '')
+        pdf_surface.set_metadata(cairo.PDF_METADATA_CREATOR, '')
         pdf_surface.restrict_to_version(self.pdf_version)
         pdf_context = cairo.Context(pdf_surface)
 
@@ -146,26 +152,16 @@ class PDFParser(abstract.AbstractParser):
         document.set_creation_date(-1)
         document.save('file://' + GLib.Uri.escape_string(os.path.abspath(out_file), '/', True))
 
-        # Cairo adds "/Producer" and "/CreationDate", and Poppler sometimes
-        # fails to remove them, we have to use this terrible regex.
-        # It should(tm) be alright though, because cairo's output format
-        # for metadata is fixed.
-        with open(out_file, 'rb') as f:
-            out = re.sub(rb'<<[\s\n]*/Producer.*?>>', b' << >>', f.read(),
-                         count=0, flags=re.DOTALL | re.IGNORECASE)
-        with open(out_file, 'wb') as f:
-            f.write(out)
-
         return True
 
     @staticmethod
-    def __parse_metadata_field(data: str) -> Dict[str, str]:
+    def __parse_metadata_field(data: str) -> dict[str, str]:
         metadata = {}
-        for (_, key, value) in re.findall(r"<(xmp|pdfx|pdf|xmpMM):(.+)>(.+)</\1:\2>", data, re.I):
+        for (_, key, value) in re.findall(r"<(xmp|pdfx|pdf|xmpMM):(.+)>(.+)</\1:\2>", data, re.IGNORECASE):
             metadata[key] = value
         return metadata
 
-    def get_meta(self) -> Dict[str, Union[str, Dict]]:
+    def get_meta(self) -> dict[str, str | dict]:
         """ Return a dict with all the meta of the file
         """
         metadata = {}

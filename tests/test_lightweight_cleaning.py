@@ -3,6 +3,8 @@
 import unittest
 import shutil
 import os
+import re
+import zlib
 
 from libmat2 import pdf, images, torrent
 
@@ -12,7 +14,7 @@ class TestLightWeightCleaning(unittest.TestCase):
             'name': 'pdf',
             'parser': pdf.PDFParser,
             'meta': {'producer': 'pdfTeX-1.40.14'},
-            'expected_meta': {'creation-date': -1, 'format': 'PDF-1.4', 'mod-date': -1},
+            'expected_meta': {'creation-date': -1, 'format': 'PDF-1.5', 'mod-date': -1},
             }, {
                 'name': 'png',
                 'parser': images.PNGParser,
@@ -29,10 +31,24 @@ class TestLightWeightCleaning(unittest.TestCase):
                 'meta': {'Warning': '[minor] Improper EXIF header'},
                 'expected_meta': {},
             }, {
+                'name': 'avif',
+                'parser': images.AVIFParser,
+                'meta': {'Description': 'This is a comment, be careful!'},
+                'expected_meta': {},
+            }, {
+                'name': 'jxl',
+                'parser': images.JXLParser,
+                'meta': {'Description': 'This is a comment, be careful!'},
+                'expected_meta': {},
+            }, {
                 'name': 'torrent',
                 'parser': torrent.TorrentParser,
                 'meta': {'created by': b'mktorrent 1.0'},
-                'expected_meta': {},
+                'expected_meta': {
+                    'announce': b'udp://tracker.torrent.eu.org:451',
+                    'announce-list': [[b'udp://tracker.torrent.eu.org:451'],
+                                      [b'udp://tracker.coppersurfer.tk:6969']],
+                },
             },{
                 'name': 'tiff',
                 'parser': images.TiffParser,
@@ -78,3 +94,33 @@ class TestLightWeightCleaning(unittest.TestCase):
 
         os.remove(target)
         os.remove(p1.output_filename)
+
+    def test_pdf_does_not_keep_creation_date(self):
+        for lightweight in (False, True):
+            target = './tests/data/clean.pdf'
+            shutil.copy('./tests/data/dirty.pdf', target)
+            parser = pdf.PDFParser(target)
+            parser.lightweight_cleaning = lightweight
+            self.assertTrue(parser.remove_all())
+
+            with open(parser.output_filename, 'rb') as f:
+                data = f.read()
+            streams = re.findall(rb'stream\r?\n(.*?)endstream', data,
+                                 flags=re.DOTALL)
+            decoded = b''.join(
+                zlib.decompress(stream.rstrip(b'\r\n'))
+                for stream in streams
+                if _is_zlib_stream(stream)
+            )
+            self.assertNotIn(b'/CreationDate (D:', decoded)
+
+            os.remove(target)
+            os.remove(parser.output_filename)
+
+
+def _is_zlib_stream(stream):
+    try:
+        zlib.decompress(stream.rstrip(b'\r\n'))
+    except zlib.error:
+        return False
+    return True

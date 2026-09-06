@@ -1,12 +1,15 @@
+from __future__ import annotations
+
 __lazy_modules__ = ['mutagen']
 
 import mimetypes
 import os
 import shutil
 import tempfile
-from typing import Union, Dict
 
 import mutagen
+import mutagen.apev2
+import mutagen.id3
 
 from . import abstract, parser_factory, video
 
@@ -20,19 +23,39 @@ class MutagenParser(abstract.AbstractParser):
         except mutagen.MutagenError as e:
             raise ValueError(e)
 
-    def get_meta(self) -> Dict[str, Union[str, Dict]]:
+    def get_meta(self) -> dict[str, str | dict]:
         f = mutagen.File(self.filename)
         if f.tags:
             return {k: ', '.join(map(str, v)) for k, v in f.tags.items()}
         return {}
 
+    def _remove_appended_tags(self) -> None:
+        """ mutagen.File() only binds the container's primary tag, so an APEv2
+        or ID3 block glued to the file is left untouched by delete(). """
+        for module in (mutagen.apev2, mutagen.id3):
+            try:
+                module.delete(self.output_filename)
+            except mutagen.MutagenError as e:
+                raise ValueError(e)
+
+    @staticmethod
+    def _blank_vendor_string(f) -> None:
+        """ The Vorbis-comment vendor string (Ogg, FLAC) is a distinct field
+        from the comment list, so delete() leaves the encoder's build string
+        in place. """
+        if f.tags is not None and hasattr(f.tags, 'vendor'):
+            f.tags.vendor = ''
+
     def remove_all(self) -> bool:
         shutil.copy(self.filename, self.output_filename)
-        f = mutagen.File(self.output_filename)
         try:
+            f = mutagen.File(self.output_filename)
             f.delete()
+            self._blank_vendor_string(f)
             f.save()
-        except mutagen.MutagenError as e:
+            self._remove_appended_tags()
+        except (mutagen.MutagenError, ValueError) as e:
+            os.remove(self.output_filename)
             raise ValueError(e)
         return True
 
@@ -40,8 +63,8 @@ class MutagenParser(abstract.AbstractParser):
 class MP3Parser(MutagenParser):
     mimetypes = {'audio/mpeg', }
 
-    def get_meta(self) -> Dict[str, Union[str, Dict]]:
-        metadata: Dict[str, Union[str, Dict]] = dict()
+    def get_meta(self) -> dict[str, str | dict]:
+        metadata: dict[str, str | dict] = dict()
         meta = mutagen.File(self.filename).tags
         if not meta:
             return metadata
@@ -64,13 +87,19 @@ class FLACParser(MutagenParser):
 
     def remove_all(self) -> bool:
         shutil.copy(self.filename, self.output_filename)
-        f = mutagen.File(self.output_filename)
-        f.clear_pictures()
-        f.delete()
-        f.save(deleteid3=True)
+        try:
+            f = mutagen.File(self.output_filename)
+            f.clear_pictures()
+            f.delete()
+            self._blank_vendor_string(f)
+            f.save(deleteid3=True)
+            self._remove_appended_tags()
+        except (mutagen.MutagenError, ValueError) as e:
+            os.remove(self.output_filename)
+            raise ValueError(e)
         return True
 
-    def get_meta(self) -> Dict[str, Union[str, Dict]]:
+    def get_meta(self) -> dict[str, str | dict]:
         meta = super().get_meta()
         for num, picture in enumerate(mutagen.File(self.filename).pictures):
             name = picture.desc if picture.desc else 'Cover %d' % num

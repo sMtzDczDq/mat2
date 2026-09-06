@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import logging
-from typing import Union, Dict, List, Tuple
 
 from . import abstract
 
@@ -15,10 +16,15 @@ class TorrentParser(abstract.AbstractParser):
         if self.dict_repr is None:
             raise ValueError
 
-    def get_meta(self) -> Dict[str, Union[str, Dict]]:
+    def get_meta(self) -> dict[str, str | dict]:
         metadata = {}
         for key, value in self.dict_repr.items():
-            if key not in self.allowlist:
+            # `announce`/`announce-list` are kept by `remove_all` since removing
+            # them would break the torrent, but they can embed a private-tracker
+            # passkey, so they must be reported rather than hidden. Only `info`
+            # is skipped: it's kept verbatim (any change alters the infohash)
+            # and holds the binary piece data.
+            if key != b'info':
                 metadata[key.decode('utf-8')] = value
         return metadata
 
@@ -45,7 +51,7 @@ class _BencodeHandler:
             ord('i'): self.__decode_int,
             ord('l'): self.__decode_list,
         }
-        for i in range(0, 10):
+        for i in range(10):
             self.__decode_func[ord(str(i))] = self.__decode_string
 
         self.__encode_func = {
@@ -56,7 +62,7 @@ class _BencodeHandler:
         }
 
     @staticmethod
-    def __decode_int(s: bytes) -> Tuple[int, bytes]:
+    def __decode_int(s: bytes) -> tuple[int, bytes]:
         s = s[1:]
         next_idx = s.index(b'e')
         if s.startswith(b'-0'):
@@ -66,7 +72,7 @@ class _BencodeHandler:
         return int(s[:next_idx]), s[next_idx+1:]
 
     @staticmethod
-    def __decode_string(s: bytes) -> Tuple[bytes, bytes]:
+    def __decode_string(s: bytes) -> tuple[bytes, bytes]:
         colon = s.index(b':')
         # FIXME Python3 is broken here, the call to `ord` shouldn't be needed,
         # but apparently it is. This is utterly idiotic.
@@ -76,7 +82,7 @@ class _BencodeHandler:
         s = s[1:]
         return s[colon:colon+str_len], s[colon+str_len:]
 
-    def __decode_list(self, s: bytes) -> Tuple[List, bytes]:
+    def __decode_list(self, s: bytes) -> tuple[list, bytes]:
         ret = list()
         s = s[1:]  # skip leading `l`
         while s[0] != ord('e'):
@@ -84,7 +90,7 @@ class _BencodeHandler:
             ret.append(value)
         return ret, s[1:]
 
-    def __decode_dict(self, s: bytes) -> Tuple[Dict, bytes]:
+    def __decode_dict(self, s: bytes) -> tuple[dict, bytes]:
         ret = dict()
         s = s[1:]  # skip leading `d`
         while s[0] != ord(b'e'):
@@ -113,10 +119,10 @@ class _BencodeHandler:
             ret += self.__encode_func[type(value)](value)
         return b'd' + ret + b'e'
 
-    def bencode(self, s: Union[Dict, List, bytes, int]) -> bytes:
+    def bencode(self, s: dict | list | bytes | int) -> bytes:
         return self.__encode_func[type(s)](s)
 
-    def bdecode(self, s: bytes) -> Union[Dict, None]:
+    def bdecode(self, s: bytes) -> dict | None:
         try:
             ret, trail = self.__decode_func[s[0]](s)
         except (IndexError, KeyError, ValueError) as e:

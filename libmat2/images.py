@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import os
-import re
-from typing import Union, Any, Dict
+from typing import Any
 
 import cairo
 
@@ -45,7 +46,7 @@ class SVGParser(exiftool.ExiftoolParser):
         surface.finish()
         return True
 
-    def get_meta(self) -> Dict[str, Union[str, Dict]]:
+    def get_meta(self) -> dict[str, str | dict]:
         meta = super().get_meta()
 
         # The namespace is mandatory, but only the …/2000/svg is valid.
@@ -102,6 +103,7 @@ class GdkPixbufAbstractParser(exiftool.ExiftoolParser):
         this has the side-effect of completely removing metadata.
     """
     _type = ''
+    _supports_lightweight_cleaning = True
 
     def __init__(self, filename):
         super().__init__(filename)
@@ -111,7 +113,7 @@ class GdkPixbufAbstractParser(exiftool.ExiftoolParser):
             raise ValueError(e)
 
     def remove_all(self) -> bool:
-        if self.lightweight_cleaning:
+        if self.lightweight_cleaning and self._supports_lightweight_cleaning:
             return self._lightweight_cleanup()
 
         _, extension = os.path.splitext(self.filename)
@@ -142,6 +144,22 @@ class JPGParser(GdkPixbufAbstractParser):
                       'YResolution', 'Megapixels', 'ImageHeight', 'Orientation'}
 
 
+class BMPParser(GdkPixbufAbstractParser):
+    # ExifTool can read BMP metadata but cannot write cleaned BMP files.
+    _supports_lightweight_cleaning = False
+    mimetypes = {'image/bmp', 'image/x-ms-bmp'}
+    meta_allowlist = {'SourceFile', 'ExifToolVersion', 'FileName',
+                      'Directory', 'FileSize', 'FileModifyDate',
+                      'FileAccessDate', 'FileInodeChangeDate',
+                      'FilePermissions', 'FileType', 'FileTypeExtension',
+                      'MIMEType', 'BMPVersion', 'ImageWidth', 'ImageHeight',
+                      'ImageSize', 'Megapixels', 'BitsPerPixel', 'BitDepth',
+                      'Planes', 'Compression', 'ImageLength',
+                      'PixelsPerMeterX', 'PixelsPerMeterY', 'NumColors',
+                      'NumImportantColors', 'ColorSpace', 'RedMask',
+                      'GreenMask', 'BlueMask', 'AlphaMask', 'GammaRed',
+                      'GammaGreen', 'GammaBlue'}
+
 class TiffParser(GdkPixbufAbstractParser):
     _type = 'tiff'
     mimetypes = {'image/tiff'}
@@ -159,8 +177,8 @@ class TiffParser(GdkPixbufAbstractParser):
 class PPMParser(abstract.AbstractParser):
     mimetypes = {'image/x-portable-pixmap'}
 
-    def get_meta(self) -> Dict[str, Union[str, Dict]]:
-        meta: Dict[str, Union[str, Dict[Any, Any]]] = dict()
+    def get_meta(self) -> dict[str, str | dict]:
+        meta: dict[str, str | dict[Any, Any]] = dict()
         with open(self.filename) as f:
             for idx, line in enumerate(f):
                 if line.lstrip().startswith('#'):
@@ -168,12 +186,13 @@ class PPMParser(abstract.AbstractParser):
         return meta
 
     def remove_all(self) -> bool:
-        with open(self.filename) as fin:
-            with open(self.output_filename, 'w') as fout:
-                for line in fin:
-                    if not line.lstrip().startswith('#'):
-                        line = re.sub(r"\s+", "", line, flags=re.UNICODE)
-                        fout.write(line)
+        with open(self.filename, 'rb') as fin:
+            data = fin.read()
+        if data.startswith(b'P3'):
+            data = b''.join(line for line in data.splitlines(keepends=True)
+                            if not line.lstrip().startswith(b'#'))
+        with open(self.output_filename, 'wb') as fout:
+            fout.write(data)
         return True
 
 
@@ -195,6 +214,10 @@ class HEICParser(exiftool.ExiftoolParser):
             'MediaDataOffset','ImageSize', 'Megapixels'}
 
     def remove_all(self) -> bool:
+        # exiftool can't rewrite HEIF item properties (the `colr` box), so an
+        # embedded ICC profile would survive a thorough cleaning.
+        if not self.lightweight_cleaning:
+            raise RuntimeError("HEIC files can't be thoroughly cleaned. Use lightweight mode instead.")
         return self._lightweight_cleanup()
 
 class WEBPParser(GdkPixbufAbstractParser):
@@ -208,3 +231,33 @@ class WEBPParser(GdkPixbufAbstractParser):
                       'ResolutionUnit', 'XResolution', 'YCbCrSubSampling',
                       'YResolution', 'Megapixels', 'ImageHeight', 'Orientation',
                       'HorizontalScale', 'VerticalScale', 'VP8Version'}
+
+
+class AVIFParser(exiftool.ExiftoolParser):
+    mimetypes = {'image/avif'}
+    meta_allowlist = {'SourceFile', 'ExifToolVersion', 'FileName', 'Directory',
+                      'FileSize', 'FileModifyDate', 'FileAccessDate',
+                      'FileInodeChangeDate', 'FilePermissions', 'FileType',
+                      'FileTypeExtension', 'MIMEType', 'MajorBrand',
+                      'MinorVersion', 'CompatibleBrands', 'HandlerType',
+                      'PrimaryItemReference', 'AV1ConfigurationVersion',
+                      'ChromaFormat', 'ChromaSamplePosition', 'ImageWidth',
+                      'ImageHeight', 'ImageSpatialExtent', 'ImagePixelDepth',
+                      'MediaDataSize', 'MediaDataOffset', 'ImageSize',
+                      'Megapixels'}
+
+    def remove_all(self) -> bool:
+        return self._lightweight_cleanup()
+
+
+class JXLParser(exiftool.ExiftoolParser):
+    mimetypes = {'image/jxl'}
+    meta_allowlist = {'SourceFile', 'ExifToolVersion', 'FileName', 'Directory',
+                      'FileSize', 'FileModifyDate', 'FileAccessDate',
+                      'FileInodeChangeDate', 'FilePermissions', 'FileType',
+                      'FileTypeExtension', 'MIMEType', 'MajorBrand',
+                      'MinorVersion', 'CompatibleBrands', 'ImageWidth',
+                      'ImageHeight', 'ImageSize', 'Megapixels'}
+
+    def remove_all(self) -> bool:
+        return self._lightweight_cleanup()

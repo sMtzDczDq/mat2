@@ -1,21 +1,72 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "mat2"
-version = "0.14.0"
+version = "0.15.0"
 description = "mat2 is a metadata removal tool, supporting a wide range of commonly used file formats, written in python3: at its core, it's a library, used by an eponymous command-line interface, as well as several file manager extensions."
 readme = "README.md"
-license = {file = "LICENSE"}
-requires-python = ">=3.8"
+license = "LGPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [
+        {name = "Julien (jvoisin) Voisin", email = "julien.voisin+mat2@dustri.org"},
+]
 dependencies = [
         'mutagen',
         'PyGObject',
         'pycairo',
 ]
+classifiers = [
+        "Development Status :: 5 - Production/Stable",
+        "Environment :: Console",
+        "Operating System :: OS Independent",
+        "Programming Language :: Python :: 3 :: Only",
+        "Topic :: Security",
+        "Topic :: File Formats",
+        "Intended Audience :: End Users/Desktop",
+]
+
 [project.urls]
 Repository = "https://github.com/jvoisin/mat2"
 Issues = "https://github.com/jvoisin/mat2/issues"
 Changelog = "https://github.com/jvoisin/mat2/blob/master/CHANGELOG.md"
 
+[tool.setuptools]
+script-files = ["mat2"]
+
+[tool.setuptools.packages.find]
+exclude = ["tests*"]
+namespaces = false
+
+[tool.setuptools.data-files]
+"share/man/man1" = ["doc/mat2.1"]
+
 [tool.ruff]
-target-version = "py39"
-# E501 Line too long
-ignore = ["E501", "F401", "E402", "E722"]
+target-version = "py38"
+exclude = ["./tests/"]
+
+[tool.ruff.lint]
+ignore = [
+	# Poor taste/so what/no ones.
+	"I001",    # Import block is un-sorted or un-formatted
+	"SIM102",  # Use a single `if` statement instead of nested `if` statements
+	"C408",    # Unnecessary `list()` call (rewrite as a literal)
+	"UP031",   # Use format specifiers instead of percent format
+	"LOG015",  # `error()` call on root logger
+	"C417",    # Unnecessary `map()` usage (rewrite using a generator expression)
+	"SIM117",  # Use a single `with` statement with multiple contexts instead of nested `with` statements
+	"BLE001",  # Do not catch blind exception: `Exception`
+	"SIM103",  # Return the negated condition directly
+
+	# Plain wrong. 
+	"EXE001",  # Shebang is present but file is not executable
+	"PERF402", # Use `list` or `list.copy` to create a copy of a list
+	"DTZ006",  # `datetime.datetime.fromtimestamp()` called without a `tz` argument
+	"DTZ001",  # `datetime.datetime()` called without a `tzinfo` argument
+
+
+	# Move to frozendict once we're at Python 3.15
+	"RUF012",  # Mutable default value for class attribute
+]

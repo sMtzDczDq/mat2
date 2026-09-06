@@ -1,16 +1,16 @@
+from __future__ import annotations
+
 import subprocess
 import functools
 import shutil
 import logging
-
-from typing import Union, Dict
 
 from . import exiftool
 
 class AbstractFFmpegParser(exiftool.ExiftoolParser):
     """ Abstract parser for all FFmpeg-based ones, mainly for video. """
     # Some fileformats have mandatory metadata fields
-    meta_key_value_allowlist: Dict[str, Union[str, int]] = dict()
+    meta_key_value_allowlist: dict[str, str | int] = dict()
 
     def remove_all(self) -> bool:
         if self.meta_key_value_allowlist:
@@ -33,16 +33,16 @@ class AbstractFFmpegParser(exiftool.ExiftoolParser):
                '-movflags', '+faststart', # place moov atom to front of file
                self.output_filename]
         try:
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL)
         except subprocess.CalledProcessError as e:
             logging.error("Something went wrong during the processing of %s: return code %d", self.filename, e.returncode)
             return False
         return True
 
-    def get_meta(self) -> Dict[str, Union[str, Dict]]:
+    def get_meta(self) -> dict[str, str | dict]:
         meta = super().get_meta()
 
-        ret: Dict[str, Union[str, Dict]] = dict()
+        ret: dict[str, str | dict] = dict()
         for key, value in meta.items():
             if key in self.meta_key_value_allowlist:
                 if value == self.meta_key_value_allowlist[key]:

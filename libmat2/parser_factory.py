@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import glob
 import os
 import mimetypes
 import importlib
-from typing import TypeVar, Optional, List, Tuple
+from typing import TypeVar
 
 from . import abstract, UNSUPPORTED_EXTENSIONS
 
@@ -14,17 +16,15 @@ mimetypes.add_type('application/x-dtbncx+xml', '.ncx')  # EPUB Navigation Contro
 # This should be removed after we move to python3.10
 # https://github.com/python/cpython/commit/20a5b7e986377bdfd929d7e8c4e3db5847dfdb2d
 mimetypes.add_type('image/heic', '.heic')
+mimetypes.add_type('image/avif', '.avif')
+mimetypes.add_type('image/jxl', '.jxl')
 
 
 def __load_all_parsers():
     """ Loads every parser in a dynamic way """
     current_dir = os.path.dirname(__file__)
     for fname in glob.glob(os.path.join(current_dir, '*.py')):
-        if fname.endswith('abstract.py'):
-            continue
-        elif fname.endswith('__init__.py'):
-            continue
-        elif fname.endswith('exiftool.py'):
+        if fname.endswith(('abstract.py', '__init__.py', 'exiftool.py')):
             continue
         basename = os.path.basename(fname)
         name, _ = os.path.splitext(basename)
@@ -34,7 +34,7 @@ def __load_all_parsers():
 __load_all_parsers()
 
 
-def _get_parsers() -> List[T]:
+def _get_parsers() -> list[T]:
     """ Get all our parsers!"""
     def __get_parsers(cls):
         return cls.__subclasses__() + \
@@ -42,7 +42,7 @@ def _get_parsers() -> List[T]:
     return __get_parsers(abstract.AbstractParser)
 
 
-def get_parser(filename: str) -> Tuple[Optional[T], Optional[str]]:
+def get_parser(filename: str) -> tuple[T | None, str | None]:
     """ Return the appropriate parser for a given filename.
 
         :raises ValueError: Raised if the instantiation of the parser went wrong.

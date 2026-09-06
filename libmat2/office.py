@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 import random
 import uuid
 import logging
 import os
+import posixpath
 import re
 import zipfile
-from typing import Pattern, Any, Tuple, Dict
+from typing import Any
 
 import xml.etree.ElementTree as ET  # type: ignore
 
@@ -13,19 +16,60 @@ from .archive import ZipParser
 # pylint: disable=line-too-long
 
 
-def _parse_xml(full_path: str) -> Tuple[ET.ElementTree, Dict[str, str]]:
+def _parse_xml(full_path: str) -> tuple[ET.ElementTree, dict[str, str]]:
     """ This function parses XML, with namespace support. """
     namespace_map = dict()
     for _, (key, value) in ET.iterparse(full_path, ("start-ns", )):
         # The ns[0-9]+ namespaces are reserved for internal usage, so
         # we have to use an other nomenclature.
-        if re.match('^ns[0-9]+$', key, re.I):  # pragma: no cover
+        if re.match('^ns[0-9]+$', key, re.IGNORECASE):  # pragma: no cover
             key = 'mat' + key[2:]
 
         namespace_map[key] = value
         ET.register_namespace(key, value)
 
     return ET.parse(full_path), namespace_map
+
+
+# The OpenDocument spec fixes these namespace URIs, so matching an element by
+# its `{uri}local` tag stays independent of the document's namespace prefixes
+# while, unlike matching on the local name alone, not colliding with same-named
+# elements from other namespaces (e.g. MathML's `annotation` in an embedded
+# formula object).
+_ODF_OFFICE_NS = 'urn:oasis:names:tc:opendocument:xmlns:office:1.0'
+_ODF_TEXT_NS = 'urn:oasis:names:tc:opendocument:xmlns:text:1.0'
+_ODF_TABLE_NS = 'urn:oasis:names:tc:opendocument:xmlns:table:1.0'
+
+# The OOXML spec fixes these namespace URIs too, so we match elements by their
+# `{uri}local` tag rather than the document's `w`/`p`/`p14` prefixes, which are
+# only conventions.
+_OOXML_WORD_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+_OOXML_PRESENTATION_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+_OOXML_POWERPOINT_2010_NS = 'http://schemas.microsoft.com/office/powerpoint/2010/main'
+
+
+def _remove_element_keeping_tail(parent: ET.Element, element: ET.Element) -> None:
+    """ Remove `element` from `parent`, grafting its tail text onto the previous
+    sibling (or the parent's own text when it's the first child), so that the
+    document text surrounding an inline marker survives its removal. """
+    index = list(parent).index(element)
+    if element.tail:
+        if index == 0:
+            parent.text = (parent.text or '') + element.tail
+        else:
+            previous = parent[index - 1]
+            previous.tail = (previous.tail or '') + element.tail
+    parent.remove(element)
+
+
+def _build_parent_map(tree) -> dict[ET.Element, ET.Element]:
+    """ Map every element to its parent. ElementTree elements don't know their
+    parent, so we build the lookup by walking each element's children. """
+    parent_map = {}
+    for parent in tree.iter():
+        for child in parent:
+            parent_map[child] = parent
+    return parent_map
 
 
 def _sort_xml_attributes(full_path: str) -> bool:
@@ -35,8 +79,12 @@ def _sort_xml_attributes(full_path: str) -> bool:
     """
     tree = ET.parse(full_path)
 
-    for c in tree.getroot():
-        c[:] = sorted(c, key=lambda child: (child.tag, child.get('desc')))
+    for element in tree.iter():
+        if len(element.attrib) < 2:
+            continue
+        attributes = sorted(element.attrib.items())
+        element.attrib.clear()
+        element.attrib.update(attributes)
 
     tree.write(full_path, xml_declaration=True, encoding='utf-8')
     return True
@@ -91,6 +139,8 @@ class MSOfficeParser(ZipParser):
             'cNvPr': set(),
             'rid': set(),
             }
+        self.__members_to_remove: set[str] | None = None
+        self.__rels_members: dict[str, bytes] | None = None
 
         self.files_to_keep = set(map(re.compile, {  # type: ignore
             r'^\[Content_Types\]\.xml$',
@@ -173,7 +223,7 @@ class MSOfficeParser(ZipParser):
                 return False
             xml_data = zin.read('[Content_Types].xml')
 
-        self.content_types: Dict[str, str] = dict()
+        self.content_types: dict[str, str] = dict()
         try:
             tree = ET.fromstring(xml_data)
         except ET.ParseError:
@@ -181,10 +231,21 @@ class MSOfficeParser(ZipParser):
         for c in tree:
             if 'PartName' not in c.attrib or 'ContentType' not in c.attrib:  # pragma: no cover
                 continue
-            elif c.attrib['ContentType'] in self.content_types_to_keep:
-                fname = c.attrib['PartName'][1:]  # remove leading `/`
-                re_fname = re.compile('^' + re.escape(fname) + '$')
-                self.files_to_keep.add(re_fname)  # type: ignore
+            partname = c.attrib['PartName']
+            # A conformant PartName is absolute, but crafted files might not be.
+            if partname.startswith('/'):
+                partname = partname[1:]
+            content_type = c.attrib['ContentType']
+            self.content_types[partname] = content_type
+            if content_type not in self.content_types_to_keep:
+                continue
+            # A document-chosen PartName must not resurrect a part we
+            # explicitly omit (e.g. people.xml or docProps/custom.xml relabelled
+            # with a kept content type), so let the omit list win here.
+            if any(o.search(partname) for o in self.files_to_omit):
+                continue
+            re_fname = re.compile('^' + re.escape(partname) + '$')
+            self.files_to_keep.add(re_fname)  # type: ignore
         return True
 
     @staticmethod
@@ -203,11 +264,11 @@ class MSOfficeParser(ZipParser):
             logging.error("Unable to parse %s: %s", full_path, e)
             return False
 
-        # rsid, tags or attributes, are always under the `w` namespace
-        if 'w' not in namespace:
+        # rsid tags and attributes live in the wordprocessingml namespace.
+        if _OOXML_WORD_NS not in namespace.values():
             return True
 
-        parent_map = {c:p for p in tree.iter() for c in p}
+        parent_map = _build_parent_map(tree)
 
         elements_to_remove = list()
         for item in tree.iterfind('.//', namespace):
@@ -234,20 +295,18 @@ class MSOfficeParser(ZipParser):
         See the spec for more details: https://docs.microsoft.com/en-us/dotnet/api/documentformat.openxml.wordprocessing.nsid?view=openxml-2.8.1
         """
         try:
-            tree, namespace = _parse_xml(full_path)
+            tree, _namespace = _parse_xml(full_path)
         except ET.ParseError as e:  # pragma: no cover
             logging.error("Unable to parse %s: %s", full_path, e)
             return False
 
-        # The nsid tag is always under the `w` namespace
-        if 'w' not in namespace:
+        nsid_tag = '{%s}nsid' % _OOXML_WORD_NS
+        elements_to_remove = [element for element in tree.iter()
+                              if element.tag == nsid_tag]
+        if not elements_to_remove:
             return True
 
-        parent_map = {c: p for p in tree.iter() for c in p}
-
-        elements_to_remove = list()
-        for element in tree.iterfind('.//w:nsid', namespace):
-            elements_to_remove.append(element)
+        parent_map = _build_parent_map(tree)
         for element in elements_to_remove:
             parent_map[element].remove(element)
 
@@ -257,90 +316,116 @@ class MSOfficeParser(ZipParser):
     @staticmethod
     def __remove_revisions(full_path: str) -> bool:
         try:
-            tree, namespace = _parse_xml(full_path)
+            tree, _namespace = _parse_xml(full_path)
         except ET.ParseError as e:  # pragma: no cover
             logging.error("Unable to parse %s: %s", full_path, e)
             return False
 
-        # Revisions are either deletions (`w:del`) or
-        # insertions (`w:ins`)
-        del_presence = tree.find('.//w:del', namespace)
-        ins_presence = tree.find('.//w:ins', namespace)
-        if del_presence is None and ins_presence is None:
+        revision_names = {
+            'del', 'ins', 'moveFrom', 'moveTo', 'moveFromRangeStart',
+            'moveFromRangeEnd', 'moveToRangeStart', 'moveToRangeEnd',
+            'cellIns', 'cellDel', 'cellMerge', 'rPrChange', 'pPrChange',
+            'sectPrChange', 'tblPrChange', 'trPrChange', 'tcPrChange',
+            'tblGridChange',
+            'numberingChange', 'customXmlInsRangeStart',
+            'customXmlInsRangeEnd', 'customXmlDelRangeStart',
+            'customXmlDelRangeEnd', 'customXmlMoveFromRangeStart',
+            'customXmlMoveFromRangeEnd', 'customXmlMoveToRangeStart',
+            'customXmlMoveToRangeEnd'
+        }
+        namespace_prefix = '{%s}' % _OOXML_WORD_NS
+
+        def _tag_local_name(tag: str) -> str:
+            return tag.removeprefix(namespace_prefix)
+
+        elements = [element for element in tree.iter()
+                if element.tag.startswith(namespace_prefix) and
+                _tag_local_name(element.tag) in revision_names]
+        if not elements:
             return True  # No revisions are present
 
-        parent_map = {c:p for p in tree.iter() for c in p}
+        parent_map = _build_parent_map(tree)
 
-        elements_del = list()
-        for element in tree.iterfind('.//w:del', namespace):
-            elements_del.append(element)
+        elements_del = [element for element in elements if
+                        _tag_local_name(element.tag) in {
+                            'del', 'moveFrom', 'moveFromRangeStart',
+                            'moveFromRangeEnd', 'moveToRangeStart',
+                            'moveToRangeEnd', 'cellDel', 'cellMerge',
+                            'rPrChange', 'pPrChange', 'sectPrChange',
+                            'tblPrChange', 'trPrChange', 'tcPrChange',
+                            'tblGridChange',
+                            'numberingChange', 'customXmlInsRangeStart',
+                            'customXmlInsRangeEnd', 'customXmlDelRangeStart',
+                            'customXmlDelRangeEnd',
+                            'customXmlMoveFromRangeStart',
+                            'customXmlMoveFromRangeEnd',
+                            'customXmlMoveToRangeStart',
+                            'customXmlMoveToRangeEnd'}]
         for element in elements_del:
             parent_map[element].remove(element)
 
-        elements_ins = list()
-        for element in tree.iterfind('.//w:ins', namespace):
-            for position, item in enumerate(tree.iter()):  # pragma: no cover
-                if item == element:
-                    for children in element.iterfind('./*'):
-                        elements_ins.append((element, position, children))
-                    break
+        elements_ins = [element for element in elements if
+                        _tag_local_name(element.tag) in
+                        {'ins', 'moveTo', 'cellIns'}]
 
-        for (element, position, children) in elements_ins:
-            parent_map[element].insert(position, children)
+        # Keep the children where the wrapper was. The index has to be the
+        # element's position among its own siblings, not its position in a
+        # walk of the whole tree, or the content lands at the end of the
+        # paragraph and the sentence comes out reordered.
+        for element in elements_ins:
+            parent = parent_map[element]
+            position = list(parent).index(element)
+            for offset, children in enumerate(list(element)):
+                parent.insert(position + offset, children)
+            if element in parent:
+                parent.remove(element)
 
-        # the list can sometimes contain duplicate elements, so don't remove
-        # until all children have been processed
-        for (element, position, children) in elements_ins:
-            if element in parent_map[element]:
-                parent_map[element].remove(element)
+        # Track-change wrappers are removed above, but revision metadata can
+        # still remain on regular nodes as w:* attributes. Strip them to avoid
+        # leaking editor identity and revision timestamps.
+        revision_attributes = {'author', 'date', 'userId', 'initials', 'ed'}
+        for element in tree.iter():
+            for key in list(element.attrib):
+                if not key.startswith(namespace_prefix):
+                    continue
+                local_name = key.removeprefix(namespace_prefix)
+                if local_name in revision_attributes:
+                    del element.attrib[key]
 
         tree.write(full_path, xml_declaration=True, encoding='utf-8')
         return True
 
     @staticmethod
-    def __remove_document_comment_meta(full_path: str) -> bool:
+    def __remove_comment_meta(full_path: str) -> bool:
         try:
-            tree, namespace = _parse_xml(full_path)
+            tree, _namespace = _parse_xml(full_path)
         except ET.ParseError as e:  # pragma: no cover
             logging.error("Unable to parse %s: %s", full_path, e)
             return False
 
-        # search the docs to see if we can bail early
-        range_start = tree.find('.//w:commentRangeStart', namespace)
-        range_end = tree.find('.//w:commentRangeEnd', namespace)
-        references = tree.find('.//w:commentReference', namespace)
-        if range_start is None and range_end is None and references is None:
+        namespace_prefix = '{%s}' % _OOXML_WORD_NS
+        comment_tags = {
+            namespace_prefix + 'commentRangeStart',
+            namespace_prefix + 'commentRangeEnd',
+            namespace_prefix + 'commentReference',
+        }
+
+        elements_del = [element for element in tree.iter()
+                        if element.tag in comment_tags]
+        if not elements_del:
             return True  # No comment meta tags are present
 
-        parent_map = {c:p for p in tree.iter() for c in p}
-
-        # iterate over the elements and add them to list
-        elements_del = list()
-        for element in tree.iterfind('.//w:commentRangeStart', namespace):
-            elements_del.append(element)
-        for element in tree.iterfind('.//w:commentRangeEnd', namespace):
-            elements_del.append(element)
-        for element in tree.iterfind('.//w:commentReference', namespace):
-            elements_del.append(element)
-
-        # remove the elements
+        parent_map = _build_parent_map(tree)
         for element in elements_del:
             parent_map[element].remove(element)
 
         tree.write(full_path, xml_declaration=True, encoding='utf-8')
         return True
 
-    def __remove_document_xml_rels_members(self, full_path: str) -> bool:
-        """ Remove the dangling references from the word/_rels/document.xml.rels file, since MS office doesn't like them.
-        """
-        try:
-            tree, namespace = _parse_xml(full_path)
-        except ET.ParseError as e:  # pragma: no cover
-            logging.error("Unable to parse %s: %s", full_path, e)
-            return False
-
-        if len(namespace.items()) != 1:  # pragma: no cover
-            logging.getLogger(__name__).debug("Got several namespaces for Types: %s", namespace.items())
+    def __get_members_to_remove(self) -> set[str]:
+        """ The set of members that `remove_all` will drop from the archive. """
+        if self.__members_to_remove is not None:
+            return self.__members_to_remove
 
         removed_fnames = set()
         with zipfile.ZipFile(self.filename) as zin:
@@ -352,11 +437,117 @@ class MSOfficeParser(ZipParser):
                             continue
                         removed_fnames.add(fname)
                         break
+        self.__members_to_remove = removed_fnames
+        return removed_fnames
+
+    def __get_rels_members(self) -> dict[str, bytes]:
+        """ The content of every `.rels` member, read in a single pass over
+        the archive. """
+        if self.__rels_members is None:
+            with zipfile.ZipFile(self.filename) as zin:
+                self.__rels_members = {name: zin.read(name)
+                                       for name in zin.namelist()
+                                       if name.endswith('.rels')}
+        return self.__rels_members
+
+    @staticmethod
+    def __resolve_rel_target(base: str, target: str) -> str:
+        """ Resolve a relationship `Target` (`../customXml/item1.xml`,
+        `/word/styles.xml`, `media/image1.png`, `#_Toc42`, …) against `base`
+        into a zip member name. Returns an empty string when the target is
+        only a bookmark, not a part.
+
+        Zip member names use forward slashes on every platform, hence
+        posixpath rather than os.path.
+        """
+        target = target.partition('#')[0]  # `styles.xml#anchor` -> `styles.xml`
+        if not target:
+            return ''
+        if target.startswith('/'):  # already relative to the package root
+            return target.removeprefix('/')
+        return posixpath.normpath(posixpath.join(base, target))
+
+    def __dead_rel_ids(self, member_name: str) -> set[str]:
+        """ The relationship ids of `member_name` that point at a part
+        `remove_all` drops. """
+        rels_name = posixpath.join(posixpath.dirname(member_name), '_rels',
+                                   posixpath.basename(member_name) + '.rels')
+        base = posixpath.dirname(member_name)
+        dead: set[str] = set()
+        content = self.__get_rels_members().get(rels_name)
+        if content is None:
+            return dead
+        try:
+            root = ET.fromstring(content)
+        except ET.ParseError:  # pragma: no cover
+            return dead
+        members_to_remove = self.__get_members_to_remove()
+        for item in root:
+            if item.attrib.get('TargetMode') == 'External':
+                continue
+            name = self.__resolve_rel_target(base, item.attrib.get('Target', ''))
+            if not name:
+                continue
+            if name in members_to_remove:
+                dead.add(item.attrib['Id'])
+        return dead
+
+    def __remove_dead_rel_references(self, full_path: str, member_name: str) -> bool:
+        """ Drop the `r:id`/`r:embed`/… attributes pointing at relationships
+        that `__remove_rels_members` takes away, so that the part doesn't
+        reference a relationship that no longer exists. """
+        dead = self.__dead_rel_ids(member_name)
+        if not dead:
+            return True
+
+        try:
+            tree, _ = _parse_xml(full_path)
+        except ET.ParseError as e:  # pragma: no cover
+            logging.error("Unable to parse %s: %s", full_path, e)
+            return False
+
+        namespace = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+        changed = False
+        for element in tree.iter():
+            for key in [k for k, v in element.attrib.items()
+                        if k.startswith(namespace) and v in dead]:
+                del element.attrib[key]
+                changed = True
+
+        if changed:
+            tree.write(full_path, xml_declaration=True, encoding='utf-8')
+        return True
+
+    def __remove_rels_members(self, full_path: str, member_name: str) -> bool:
+        """ Remove the dangling references from a `.rels` file, since MS Office
+        doesn't like them.
+
+        Relationship targets are resolved against the folder holding the
+        `_rels` directory, so `word/_rels/document.xml.rels` pointing at
+        `../customXml/item1.xml` refers to `customXml/item1.xml`.
+        """
+        try:
+            tree, namespace = _parse_xml(full_path)
+        except ET.ParseError as e:  # pragma: no cover
+            logging.error("Unable to parse %s: %s", full_path, e)
+            return False
+
+        if len(namespace.items()) != 1:  # pragma: no cover
+            logging.getLogger(__name__).debug("Got several namespaces for Types: %s", namespace.items())
+
+        members_to_remove = self.__get_members_to_remove()
+        # the base is `word` for `word/_rels/document.xml.rels`,
+        # and the package root for `_rels/.rels`
+        base = posixpath.dirname(posixpath.dirname(member_name))
 
         root = tree.getroot()
         for item in root.findall('{%s}Relationship' % namespace['']):
-            name = 'word/' + item.attrib['Target'] # add the word/ prefix to the path, since all document rels are in the word/ directory
-            if name in removed_fnames:
+            if item.attrib.get('TargetMode') == 'External':
+                continue
+            name = self.__resolve_rel_target(base, item.attrib['Target'])
+            if not name:  # a link to a bookmark, not to a part
+                continue
+            if name in members_to_remove:
                 root.remove(item)
 
         tree.write(full_path, xml_declaration=True, encoding='utf-8')
@@ -375,21 +566,15 @@ class MSOfficeParser(ZipParser):
         if len(namespace.items()) != 1:  # pragma: no cover
             logging.getLogger(__name__).debug("Got several namespaces for Types: %s", namespace.items())
 
-        removed_fnames = set()
-        with zipfile.ZipFile(self.filename) as zin:
-            for fname in [item.filename for item in zin.infolist()]:
-                for file_to_omit in self.files_to_omit:
-                    if file_to_omit.search(fname):
-                        matches = map(lambda r: r.search(fname), self.files_to_keep)
-                        if any(matches):  # the file is in the allowlist
-                            continue
-                        removed_fnames.add(fname)
-                        break
+        members_to_remove = self.__get_members_to_remove()
 
         root = tree.getroot()
         for item in root.findall('{%s}Override' % namespace['']):
-            name = item.attrib['PartName'][1:]  # remove the leading '/'
-            if name in removed_fnames:
+            name = item.attrib['PartName']
+            # A conformant PartName is absolute, but crafted files might not be.
+            if name.startswith('/'):
+                name = name[1:]
+            if name in members_to_remove:
                 root.remove(item)
 
         tree.write(full_path, xml_declaration=True, encoding='utf-8')
@@ -422,11 +607,13 @@ class MSOfficeParser(ZipParser):
             logging.error("Unable to parse %s: %s", full_path, e)
             return False
 
-        if 'p14' not in namespace:
-            return True  # pragma: no cover
+        if _OOXML_POWERPOINT_2010_NS not in namespace.values():
+            return True
 
-        for item in tree.iterfind('.//p14:creationId', namespace):
-            item.set('val', '%s' % random.randint(0, 2**32))
+        creation_id_tag = '{%s}creationId' % _OOXML_POWERPOINT_2010_NS
+        for item in tree.iter():
+            if item.tag == creation_id_tag:
+                item.set('val', '%s' % random.randint(0, 2**32))
         tree.write(full_path, xml_declaration=True, encoding='utf-8')
         return True
 
@@ -438,20 +625,22 @@ class MSOfficeParser(ZipParser):
             logging.error("Unable to parse %s: %s", full_path, e)
             return False
 
-        if 'p' not in namespace:
-            return True  # pragma: no cover
+        if _OOXML_PRESENTATION_NS not in namespace.values():
+            return True
 
-        for item in tree.iterfind('.//p:sldMasterId', namespace):
-            item.set('id', '%s' % random.randint(0, 2**32))
+        sld_master_id_tag = '{%s}sldMasterId' % _OOXML_PRESENTATION_NS
+        for item in tree.iter():
+            if item.tag == sld_master_id_tag:
+                item.set('id', '%s' % random.randint(0, 2**32))
         tree.write(full_path, xml_declaration=True, encoding='utf-8')
         return True
 
-    def _specific_cleanup(self, full_path: str) -> bool:
+    def _specific_cleanup(self, full_path: str, member_name: str = '') -> bool:
         # pylint: disable=too-many-return-statements,too-many-branches
         if os.stat(full_path).st_size == 0:  # Don't process empty files
             return True
 
-        if not full_path.endswith(('.xml', '.xml.rels')):
+        if not full_path.lower().endswith(('.xml', '.rels')):
             return True
 
         if self.__randomize_creationId(full_path) is False:
@@ -459,36 +648,49 @@ class MSOfficeParser(ZipParser):
 
         self.__collect_counters(full_path)
 
+        if not member_name.endswith('.rels'):
+            # the part might point at relationships that are about to go away
+            if self.__remove_dead_rel_references(full_path, member_name) is False:  # pragma: no cover
+                return False
+
+        # The core/extended-properties parts carry document metadata; a crafted
+        # [Content_Types].xml can point those content types at a non-canonical
+        # PartName to dodge the path checks below, so match on the content type
+        # first, keeping the canonical path as a fallback.
+        content_type = self.content_types.get(member_name, '')
+        core_properties = 'application/vnd.openxmlformats-package.core-properties+xml'
+        extended_properties = 'application/vnd.openxmlformats-officedocument.extended-properties+xml'
+
         if full_path.endswith('/[Content_Types].xml'):
             # this file contains references to files that we might
             # remove, and MS Office doesn't like dangling references
             if self.__remove_content_type_members(full_path) is False:  # pragma: no cover
                 return False
-        elif full_path.endswith('/word/document.xml'):
-            # this file contains the revisions
-            if self.__remove_revisions(full_path) is False:
-                return False  # pragma: no cover
-            # remove comment references and ranges
-            if self.__remove_document_comment_meta(full_path) is False:
-                return False  # pragma: no cover
-        elif full_path.endswith('/word/_rels/document.xml.rels'):
-            # similar to the above, but for the document.xml.rels file
-            if self.__remove_document_xml_rels_members(full_path) is False:  # pragma: no cover
-                return False
-        elif full_path.endswith('/docProps/app.xml'):
+        elif content_type == extended_properties or full_path.endswith('/docProps/app.xml'):
             # This file must be present and valid,
             # so we're removing as much as we can.
             with open(full_path, 'wb') as f:
                 f.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
                 f.write(b'<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">')
                 f.write(b'</Properties>')
-        elif full_path.endswith('/docProps/core.xml'):
+        elif content_type == core_properties or full_path.endswith('/docProps/core.xml'):
             # This file must be present and valid,
             # so we're removing as much as we can.
             with open(full_path, 'wb') as f:
                 f.write(b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>')
                 f.write(b'<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties">')
                 f.write(b'</cp:coreProperties>')
+        elif member_name.startswith('word/') and member_name.endswith('.xml'):
+            # Revisions and comment anchors can occur in the document, notes,
+            # headers and footers.
+            if self.__remove_revisions(full_path) is False:
+                return False  # pragma: no cover
+            if self.__remove_comment_meta(full_path) is False:
+                return False  # pragma: no cover
+        elif member_name.endswith('.rels'):
+            # similar to the above, but for the relationship files
+            if self.__remove_rels_members(full_path, member_name) is False:  # pragma: no cover
+                return False
         elif full_path.endswith('/ppt/tableStyles.xml'):  # pragma: no cover
             # This file must be present and valid,
             # so we're removing as much as we can.
@@ -532,7 +734,7 @@ class MSOfficeParser(ZipParser):
 
         return True
 
-    def _specific_get_meta(self, full_path: str, file_path: str) -> Dict[str, Any]:
+    def _specific_get_meta(self, full_path: str, file_path: str) -> dict[str, Any]:
         """
         Yes, I know that parsing xml with regexp ain't pretty,
         be my guest and fix it if you want.
@@ -542,7 +744,7 @@ class MSOfficeParser(ZipParser):
 
         with open(full_path, encoding='utf-8') as f:
             try:
-                results = re.findall(r"<(.+)>(.+)</\1>", f.read(), re.I | re.M)
+                results = re.findall(r"<(.+)>(.+)</\1>", f.read(), re.IGNORECASE | re.MULTILINE)
                 return {k: v for (k, v) in results}
             except (TypeError, UnicodeDecodeError):
                 # We didn't manage to parse the xml file
@@ -568,7 +770,6 @@ class LibreOfficeParser(ZipParser):
             r'^(?:Object\s\d+/)?content\.xml$',
             r'^manifest\.rdf$',
             r'^mimetype$',
-            r'^settings\.xml$',
             r'^(?:Object\s\d+/)?styles\.xml$',
         }))
         self.files_to_omit = set(map(re.compile, {  # type: ignore
@@ -577,33 +778,88 @@ class LibreOfficeParser(ZipParser):
             r'^layout-cache$',
             r'^Configurations2/',
             r'^Thumbnails/',
+            # settings.xml holds window geometry, the last cursor position,
+            # printer and database names, and a per-release set of config keys
+            # that fingerprints the producing application; ODF makes it optional.
+            r'^settings\.xml$',
         }))
 
     @staticmethod
     def __remove_revisions(full_path: str) -> bool:
         try:
-            tree, namespace = _parse_xml(full_path)
+            tree, _namespace = _parse_xml(full_path)
         except ET.ParseError as e:
             logging.error("Unable to parse %s: %s", full_path, e)
             return False
 
-        if 'office' not in namespace:  # no revisions in the current file
-            return True
+        root = tree.getroot()
+        parent_map = _build_parent_map(root)
 
-        for text in tree.getroot().iterfind('.//office:text', namespace):
-            for changes in text.iterfind('.//text:tracked-changes', namespace):
-                text.remove(changes)
+        # Tracked changes live under `office:text` (text documents) as
+        # `text:tracked-changes` and under `office:spreadsheet` as
+        # `table:tracked-changes`; either way the container carries the deleted
+        # content and its authorship. The in-body `change`/`change-start`/
+        # `change-end` markers and any stray `office:change-info` reference
+        # change ids that no longer exist once the container is gone.
+        revision_tags = {
+            '{%s}tracked-changes' % _ODF_TEXT_NS,
+            '{%s}tracked-changes' % _ODF_TABLE_NS,
+            '{%s}change-info' % _ODF_OFFICE_NS,
+            '{%s}change' % _ODF_TEXT_NS,
+            '{%s}change-start' % _ODF_TEXT_NS,
+            '{%s}change-end' % _ODF_TEXT_NS,
+        }
+        # The inline `change`/`change-start`/`change-end` markers carry the
+        # inserted and surrounding document text in their tail, which
+        # `_remove_element_keeping_tail` preserves.
+        for element in [e for e in root.iter() if e.tag in revision_tags]:
+            parent = parent_map.get(element)
+            if parent is not None:
+                _remove_element_keeping_tail(parent, element)
 
         tree.write(full_path, xml_declaration=True, encoding='utf-8')
         return True
 
-    def _specific_cleanup(self, full_path: str) -> bool:
+    @staticmethod
+    def __remove_annotations(full_path: str) -> bool:
+        try:
+            tree, _namespace = _parse_xml(full_path)
+        except ET.ParseError as e:
+            logging.error("Unable to parse %s: %s", full_path, e)
+            return False
+
+        root = tree.getroot()
+        parent_map = _build_parent_map(root)
+
+        # Comments are stored inline as an `office:annotation` (holding the
+        # author, date, initials and the comment body) paired with an
+        # `office:annotation-end` marker. Drop both entirely, like the MS
+        # Office parser does; the commented-on document text lives in their
+        # tail and is preserved by `_remove_element_keeping_tail`.
+        annotation_tags = {
+            '{%s}annotation' % _ODF_OFFICE_NS,
+            '{%s}annotation-end' % _ODF_OFFICE_NS,
+        }
+        for element in [e for e in root.iter() if e.tag in annotation_tags]:
+            parent = parent_map.get(element)
+            if parent is not None:
+                _remove_element_keeping_tail(parent, element)
+
+        tree.write(full_path, xml_declaration=True, encoding='utf-8')
+        return True
+
+    def _specific_cleanup(self, full_path: str, member_name: str = '') -> bool:
         if os.stat(full_path).st_size == 0:  # Don't process empty files
             return True
 
         if os.path.basename(full_path).endswith('.xml'):
-            if os.path.basename(full_path) == 'content.xml':
+            # Tracked changes live in the body (`content.xml`, including an
+            # embedded `Object N/content.xml`); comments can additionally live
+            # in headers and footers, which are stored in `styles.xml`.
+            if os.path.basename(full_path) in ('content.xml', 'styles.xml'):
                 if self.__remove_revisions(full_path) is False:
+                    return False
+                if self.__remove_annotations(full_path) is False:
                     return False
 
             try:
@@ -613,7 +869,7 @@ class LibreOfficeParser(ZipParser):
                 return False
         return True
 
-    def _specific_get_meta(self, full_path: str, file_path: str) -> Dict[str, Any]:
+    def _specific_get_meta(self, full_path: str, file_path: str) -> dict[str, Any]:
         """
         Yes, I know that parsing xml with regexp ain't pretty,
         be my guest and fix it if you want.
@@ -622,7 +878,7 @@ class LibreOfficeParser(ZipParser):
             return {}
         with open(full_path, encoding='utf-8') as f:
             try:
-                results = re.findall(r"<((?:meta|dc|cp).+?)[^>]*>(.+)</\1>", f.read(), re.I|re.M)
+                results = re.findall(r"<((?:meta|dc|cp).+?)[^>]*>(.+)</\1>", f.read(), re.IGNORECASE|re.MULTILINE)
                 return {k:v for (k, v) in results}
             except (TypeError, UnicodeDecodeError):  # We didn't manage to parse the xml file
                 # We didn't manage to parse the xml file
