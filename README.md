@@ -150,14 +150,10 @@ of the guarantee that mat2 won't modify the data of their files, there is the
 # Contact
 
 If possible, use the [issues system](https://github.com/jvoisin/mat2/issues)
-or the [mailing list](https://www.autistici.org/mailman/listinfo/mat-dev)
+or the [mailing list](https://lists.riseup.net/www/info/mat-dev)
 Should a more private contact be needed (eg. for reporting security issues),
 you can email Julien (jvoisin) Voisin at `julien.voisin+mat2@dustri.org`,
 using the gpg key `9FCDEE9E1A381F311EA62A7404D041E8171901CC`.
-
-# Donations
-
-If you want to donate some money, please give it to [Tails]( https://tails.boum.org/donate/?r=contribute ).
 
 # License
 
@@ -172,7 +168,7 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 
 You should have received a copy of the GNU Lesser General Public License
-along with this program.  If not, see <http://www.gnu.org/licenses/>.
+along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 Copyright 2018 Julien (jvoisin) Voisin <julien.voisin+mat2@dustri.org>  
 Copyright 2016 Marie-Rose for mat2's logo
